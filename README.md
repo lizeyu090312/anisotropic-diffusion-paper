@@ -54,7 +54,7 @@ python g_sample.py --dataset afhqv2 --model_tag g-ani --steps 20
 
 ## Environment
 ```bash
-conda create -n edm_h200 python=3.9
-conda activate edm_h200
+conda create -n anidiff python=3.9
+conda activate anidiff
 pip install -r requirements.txt
 ```
