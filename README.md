@@ -10,17 +10,19 @@ jointly optimizing both the score network and the anisotropic noise allocation a
 ## Repository Structure
 ```
 anisotropic-diffusion-paper/
-├── common_utils.py              # Core math utilities and diffusion operators
-├── g_iso_train.py               # Train isotropic schedule
-├── g_iso_train_discretize.py    # Train isotropic schedule minimizing discretization error
-├── g_ani_train.py               # Train anisotropic schedule
-├── g_iso_wrapper_train.py       # Train isotropic training with wrapper
-├── g_ani_wrapper_train.py       # Train anisotropic training with wrapper
-├── g_sample.py                  # Unified sampling interface
-├── run_all_train_and_sample.sh  # Shell script for all datasets
-├── fid.py                       # FID computation
-├── requirements.txt             # Environment dependencies
-└── training/                    # EDM-style training utilities
+├── common_utils.py                                 # Core math utilities and diffusion operators
+├── g_iso_train.py                                  # Train isotropic schedule
+├── g_iso_train_discretize.py                       # Train isotropic schedule minimizing discretization error
+├── g_ani_train.py                                  # Train anisotropic schedule
+├── g_iso_wrapper_train.py                          # Train isotropic training with wrapper
+├── g_ani_wrapper_train.py                          # Train anisotropic training with wrapper
+├── g_sample.py                                     # Unified sampling interface
+├── run_all_train_and_sample.sh                     # Shell script for all datasets
+├── requirements.txt                                # Environment dependencies
+├── torch_utils/                                    # From NVLabs/edm
+├── training/                                       # From NVLabs/edm
+├── dnnlib/                                         # From NVLabs/edm
+└── train.py, generate.py, fid.py, dataset_tool.py  # From NVLabs/edm
 ```
 
 ## Usage
