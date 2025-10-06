@@ -7,8 +7,6 @@ M_t = g(t)V + h(t)(I - V),
 \]
 jointly optimizing both the score network and the anisotropic noise allocation across subspaces.
 
----
-
 ## Repository Structure
 ```
 anisotropic-diffusion-paper/
@@ -24,8 +22,6 @@ anisotropic-diffusion-paper/
 ├── requirements.txt             # Environment dependencies
 └── training/                    # EDM-style training utilities
 ```
-
----
 
 ## Usage
 
