@@ -12,7 +12,7 @@ jointly optimizing both the score network and the anisotropic noise allocation a
 anisotropic-diffusion-paper/
 ├── common_utils.py              # Core math utilities and diffusion operators
 ├── g_iso_train.py               # Train isotropic schedule
-├── g_iso_train_discretize.py    # Train discretization-corrected isotropic schedule
+├── g_iso_train_discretize.py    # Train isotropic schedule minimizing discretization error
 ├── g_ani_train.py               # Train anisotropic schedule
 ├── g_iso_wrapper_train.py       # Train isotropic training with wrapper
 ├── g_ani_wrapper_train.py       # Train anisotropic training with wrapper
