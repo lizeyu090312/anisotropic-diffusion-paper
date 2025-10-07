@@ -142,7 +142,7 @@ def main():
 
         # Save checkpoints periodically
         if batches_done % 50 == 0:
-            ckpt_path = outdir / f"finetuned-g-ani-wrapper-{batches_done}.pkl"
+            ckpt_path = outdir / f"finetuned-g-ani-wrapper-ckpt-{batches_done}.pkl"
             with open(ckpt_path, "wb") as f:
                 pickle.dump({"ema": ema.cpu(), "g": g_fn.cpu(), "h": h_fn.cpu()}, f)
             print("Saved", ckpt_path)
@@ -156,3 +156,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
