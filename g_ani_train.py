@@ -38,7 +38,7 @@ def build_model_from_gonly(dataset, V_dim, res, device, T=6400.0, K=32):
     """Load pretrained g-iso weights and initialize g-ani"""
     gonly_path = f"finetune/{dataset}/finetuned-g-iso.pkl"
     print(f"Loading g-only initialization from {gonly_path}")
-    with open(gonly_path, "rb") as f:
+    with dnnlib.util.open_url(gonly_path, "rb") as f:
         ckpt = pickle.load(f)
 
     dct_V = compute_DCT_basis(k=V_dim, d=res, dtype=torch.float32, device=device)
@@ -113,8 +113,8 @@ def train(opt):
 
         for x_chunk, y_chunk in zip(x_chunks, y_chunks):
             loss = flow_matching_energy(model, x_chunk, y_chunk, g_fn, h_fn, T=T, tmin=1e-9)
-            (loss / chunk.shape[0]).backward()
-            loss_accum += (loss / chunk.shape[0]).item()
+            (loss / x_chunk.shape[0]).backward()
+            loss_accum += (loss / x_chunk.shape[0]).item()
 
         # sanitize grads
         for p in list(model.parameters()) + list(g_fn.parameters()) + list(h_fn.parameters()):
@@ -154,22 +154,23 @@ def train(opt):
 
         # checkpoint (same folder as g-only)
         if batches_done % 100 == 0:
-            ckpt_path = outdir / f"finetuned-g-ani-{batches_done:05d}.pkl"
-            torch.save({"model": model.cpu(), "ema": ema.cpu(),
-                        "g": g_fn.cpu(), "h": h_fn.cpu()}, ckpt_path)
+            ckpt_path = outdir / f"finetuned-g-ani-ckpt-{batches_done:05d}.pkl"
+            with open(ckpt_path, 'wb') as f:
+                pickle.dump({'model': model.cpu(), 'ema': ema.cpu(), 'g': g_fn.cpu(), "h": h_fn.cpu()}, f)
             print(f"Saved: {ckpt_path}")
             model.to(device); ema.to(device); g_fn.to(device); h_fn.to(device)
 
     # final save
     final_path = outdir / "finetuned-g-ani.pkl"
-    torch.save({"model": model.cpu(), "ema": ema.cpu(), "g": g_fn.cpu(), "h": h_fn.cpu()}, final_path)
+    with open(final_path, 'wb') as f:
+        pickle.dump({'model': model.cpu(), 'ema': ema.cpu(), 'g': g_fn.cpu(), "h": h_fn.cpu()}, f)
     print(f"Training finished. Final checkpoint: {final_path}")
 
 
 # ---------------- Entry ----------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="afhqv2", choices=["cifar10", "afhqv2", "ffhq"])
+    parser.add_argument("--dataset", default="cifar10", choices=["cifar10", "afhqv2", "ffhq"])
     parser.add_argument("--out", default="finetune")
     parser.add_argument("--batch", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-5)
