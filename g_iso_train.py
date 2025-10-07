@@ -98,7 +98,7 @@ def train(opt):
 
     # data + model
     dl, V_dim, res, ckpt_url = get_dataset_loader(opt.dataset, opt.batch, workers=opt.workers)
-    model, ema, g_fn, _ = build_model_and_sched(ckpt_url, V_dim, res, device)
+    model, ema, g_fn, h_fn, _ = build_model_and_sched(ckpt_url, V_dim, res, device)
 
     # optimizers
     opt_net   = torch.optim.Adam(model.parameters(), lr=opt.lr,  betas=(0.9, 0.999), eps=1e-8)
@@ -137,7 +137,7 @@ def train(opt):
 
         # forward/backward
         for x_chunk, y_chunk in zip(x_chunks, y_chunks):
-            loss = ANILoss_gh_energy(model, x_chunk, y_chunk, g_fn, g_fn, T=T, tmin=1e-9)
+            loss = ANILoss_gh_energy(model, x_chunk, y_chunk, g_fn, h_fn, T=T, tmin=1e-9)
             (loss / opt.grad_accum).backward()
             loss_accum += loss.item()
 
@@ -206,3 +206,4 @@ if __name__ == '__main__':
     parser.add_argument('--workers', type=int, default=2)
     args = parser.parse_args()
     train(args)
+
