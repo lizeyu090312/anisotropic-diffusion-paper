@@ -6,7 +6,6 @@ from common_utils import (
 )
 from data_loader import cifar10_loader, afhqv2_loader, ffhq_loader
 
-
 # ---------------- Logging ----------------
 class DualWriter:
     def __init__(self, stream1, stream2, stream3):
@@ -142,7 +141,7 @@ def main():
 
         # Save checkpoints periodically
         if batches_done % 50 == 0:
-            ckpt_path = outdir / f"finetuned-g-iso-wrapper-{batches_done}.pkl"
+            ckpt_path = outdir / f"finetuned-g-iso-wrapper-ckpt-{batches_done}.pkl"
             with open(ckpt_path, "wb") as f:
                 pickle.dump({"ema": ema.cpu(), "g": g_fn.cpu(), "h": h_fn.cpu()}, f)
             print("Saved", ckpt_path)
