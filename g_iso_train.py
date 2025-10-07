@@ -186,12 +186,15 @@ def train(opt):
         if batches_done % 100 == 0:
             ckpt_path = outdir / f"finetuned-g-iso-ckpt-{batches_done:05d}.pkl"
             torch.save({'model': model.cpu(), 'ema': ema.cpu(), 'g': g_fn.cpu()}, ckpt_path)
+            with open(ckpt_path, 'wb') as f:
+                pickle.dump({'model': model.cpu(), 'ema': ema.cpu(), 'g': g_fn.cpu()}, f)
             print(f"Saved checkpoint: {ckpt_path}")
             model.to(device); ema.to(device); g_fn.to(device)
 
     # final save
     final_path = outdir / "finetuned-g-iso.pkl"
-    torch.save({'model': model.cpu(), 'ema': ema.cpu(), 'g': g_fn.cpu()}, final_path)
+    with open(final_path, 'wb') as f:
+        pickle.dump({'model': model.cpu(), 'ema': ema.cpu(), 'g': g_fn.cpu()}, f)
     print(f"Training finished. Final checkpoint: {final_path}")
 
 # ---------------- Entry ----------------
@@ -206,4 +209,5 @@ if __name__ == '__main__':
     parser.add_argument('--workers', type=int, default=2)
     args = parser.parse_args()
     train(args)
+
 
