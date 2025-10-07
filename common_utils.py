@@ -1,5 +1,4 @@
 import math, torch, torch.nn as nn
-#from torch.func import vmap
 from torch.autograd.functional import jvp as jvp_autograd
 from torch.func import functional_call
 import torch.nn.functional as F
@@ -79,10 +78,11 @@ class GFn(nn.Module):
 
     # public API
     def forward(self, t):
-        return self._interp(t)[0]
+        return self._interp(t)
 
     def g_and_grad(self, t):
         return self._interp(t)
+
 
 def compute_DCT_basis(k: int, d: int, *, dtype=torch.float32, device="cuda") -> torch.Tensor:
     """
