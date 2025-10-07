@@ -20,14 +20,20 @@ def load_model(dataset, model_tag, device):
         g_fn = ckpt["g"].to(device)
         h_fn = ckpt["h"].to(device)
         print(f"Detected anisotropic model → using g and h schedules")
+        ckpt_net_path = f"finetune/{dataset}/finetuned-g-ani.pkl"
+        with dnnlib.util.open_url(ckpt_path) as f:
+            ckpt_net = pickle.load(f)
+        ema = ckpt_net["ema"].to(device).eval()
     else:
         # isotropic or g-only models → use g only
         g_fn = ckpt["g"].to(device)
         h_fn = g_fn
         print(f"Detected isotropic model → using g only (h = g)")
+        ckpt_net_path = f"finetune/{dataset}/finetuned-g-iso.pkl"
+        with dnnlib.util.open_url(ckpt_path) as f:
+            ckpt_net = pickle.load(f)
+        ema = ckpt_net["ema"].to(device).eval()
 
-    # --- load base edm network ---
-    ema = ckpt["ema"].to(device).eval()
 
     # --- DCT basis setup ---
     if dataset == "cifar10":
@@ -105,7 +111,7 @@ def sample_images(dataset="afhqv2", model_tag="g-ani", outdir_root="samples",
 # ===============================================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="afhqv2", choices=["cifar10", "afhqv2", "ffhq"])
+    parser.add_argument("--dataset", default="cifar10", choices=["cifar10", "afhqv2", "ffhq"])
     parser.add_argument("--model_tag", default="g-ani", help="which model to sample: g-iso / g-ani / g-iso-wrapper / g-ani-wrapper")
     parser.add_argument("--out", default="samples")
     parser.add_argument("--batch", type=int, default=2048)
