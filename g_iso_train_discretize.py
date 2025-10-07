@@ -98,7 +98,7 @@ def train(opt):
 
     # data + model
     dl, V_dim, res, ckpt_url = get_dataset_loader(opt.dataset, opt.batch, workers=opt.workers)
-    model, ema, g_fn, _ = build_model_and_sched(ckpt_url, V_dim, res, device)
+    model, ema, g_fn, h_fn, _ = build_model_and_sched(ckpt_url, V_dim, res, device)
 
     # optimizers
     opt_net   = torch.optim.Adam(model.parameters(), lr=opt.lr,  betas=(0.9, 0.999), eps=1e-8)
@@ -137,7 +137,7 @@ def train(opt):
 
         # forward/backward
         for x_chunk, y_chunk in zip(x_chunks, y_chunks):
-            loss = ANILoss_gh_energy_all_version7wud(model, x_chunk, y_chunk, g_fn, g_fn, T=T, tmin=1e-9)
+            loss = ANILoss_gh_energy_all_version7wud(model, x_chunk, y_chunk, g_fn, h_fn, T=T, tmin=1e-9)
             (loss / opt.grad_accum).backward()
             loss_accum += loss.item()
 
@@ -185,13 +185,15 @@ def train(opt):
         # periodic checkpoint
         if batches_done % 100 == 0:
             ckpt_path = outdir / f"finetuned-g-iso-discretize-ckpt-{batches_done:05d}.pkl"
-            torch.save({'model': model.cpu(), 'ema': ema.cpu(), 'g': g_fn.cpu()}, ckpt_path)
+            with open(ckpt_path, 'wb') as f:
+                pickle.dump({'model': model.cpu(), 'ema': ema.cpu(), 'g': g_fn.cpu()}, f)
             print(f"Saved checkpoint: {ckpt_path}")
             model.to(device); ema.to(device); g_fn.to(device)
 
     # final save
     final_path = outdir / "finetuned-g-iso-discretize.pkl"
-    torch.save({'model': model.cpu(), 'ema': ema.cpu(), 'g': g_fn.cpu()}, final_path)
+    with open(final_path, 'wb') as f:
+        pickle.dump({'model': model.cpu(), 'ema': ema.cpu(), 'g': g_fn.cpu()}, f)
     print(f"Training finished. Final checkpoint: {final_path}")
 
 # ---------------- Entry ----------------
@@ -206,3 +208,4 @@ if __name__ == '__main__':
     parser.add_argument('--workers', type=int, default=2)
     args = parser.parse_args()
     train(args)
+
