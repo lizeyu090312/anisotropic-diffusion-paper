@@ -185,7 +185,6 @@ def train(opt):
         # periodic checkpoint
         if batches_done % 100 == 0:
             ckpt_path = outdir / f"finetuned-g-iso-ckpt-{batches_done:05d}.pkl"
-            torch.save({'model': model.cpu(), 'ema': ema.cpu(), 'g': g_fn.cpu()}, ckpt_path)
             with open(ckpt_path, 'wb') as f:
                 pickle.dump({'model': model.cpu(), 'ema': ema.cpu(), 'g': g_fn.cpu()}, f)
             print(f"Saved checkpoint: {ckpt_path}")
