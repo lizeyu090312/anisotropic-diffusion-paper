@@ -1,4 +1,4 @@
-import math, torch, torch.nn as nn, pickle, dnnlib, tqdm, os, PIL, argparse
+import math, torch, torch.nn as nn, pickle, dnnlib, tqdm, os, PIL, argparse, matplotlib.pyplot as plt
 from common_utils import GFn, compute_DCT_basis, M_EDM_ode, ANI_absM_Precond_Wrapper
 
 torch.set_default_dtype(torch.float32)
@@ -11,7 +11,7 @@ def load_model(dataset, model_tag, device):
     print(f"Loading checkpoint: {ckpt_path}")
 
     # --- load checkpoint ---
-    with open(ckpt_path, "rb") as f:
+    with dnnlib.util.open_url(ckpt_path) as f:
         ckpt = pickle.load(f)
 
     # --- load g / h depending on model_tag ---
