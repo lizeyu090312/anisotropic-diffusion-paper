@@ -102,7 +102,7 @@ def train(opt):
 
     # optimizers
     opt_net   = torch.optim.Adam(model.parameters(), lr=opt.lr,  betas=(0.9, 0.999), eps=1e-8)
-    opt_sched = torch.optim.Adam(g_fn.parameters(),  lr=1e-2,    betas=(0.9, 0.999), eps=1e-8)
+    opt_sched = torch.optim.Adam(g_fn.parameters(),  lr=opt.glr,    betas=(0.9, 0.999), eps=1e-8)
 
     # training hyperparams
     T = 6400.0
@@ -150,13 +150,11 @@ def train(opt):
         ramp  = min(seen / max(lr_rampup_kimg * 1000, 1e-8), 1.0)  # convert kimg to img
         decay = 1.0 if seen <= total_nimg // 2 else 0.5 ** ((seen - total_nimg // 2) / (total_nimg // 8))
         lr_scale = ramp * decay
-        opt_net.param_groups[0]['lr']   = opt.lr * lr_scale
-        opt_sched.param_groups[0]['lr'] = 1e-2 * lr_scale
 
         for g in opt_net.param_groups:
             g['lr'] = opt.lr * lr_scale
         for g in opt_sched.param_groups:
-            g['lr'] = 1e-2 * lr_scale
+            g['lr'] = opt.glr * lr_scale
 
         # optimizer step
         if batches_done > 0:
@@ -184,7 +182,10 @@ def train(opt):
 
         # periodic checkpoint
         if batches_done % 100 == 0:
-            ckpt_path = outdir / f"finetuned-g-iso-ckpt-{batches_done:05d}.pkl"
+            if opt.keep_all_ckpt:
+                ckpt_path = outdir / f"finetuned-g-iso-ckpt-{batches_done:05d}.pkl"
+            else:
+                ckpt_path = outdir / "finetuned-g-iso.pkl"
             with open(ckpt_path, 'wb') as f:
                 pickle.dump({'model': model.cpu(), 'ema': ema.cpu(), 'g': g_fn.cpu()}, f)
             print(f"Saved checkpoint: {ckpt_path}")
@@ -203,9 +204,13 @@ if __name__ == '__main__':
     parser.add_argument('--out', default='finetune')
     parser.add_argument('--batch', type=int, default=256)
     parser.add_argument('--lr', type=float, default=1e-5)
+    parser.add_argument('--glr', type=float, default=1e-2)
     parser.add_argument('--kimg', type=int, default=1200)
     parser.add_argument('--grad_accum', type=int, default=4)
     parser.add_argument('--workers', type=int, default=2)
+    parser.add_argument('--keep_all_ckpt', action='store_true', help='If set, keep all periodic checkpoints instead of overwriting the latest one.')
+
     args = parser.parse_args()
     train(args)
+
 
