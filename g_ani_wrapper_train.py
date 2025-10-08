@@ -41,11 +41,12 @@ def main():
     parser.add_argument("--dataset", default="cifar10", choices=["cifar10", "afhqv2", "ffhq"])
     parser.add_argument("--out", default="finetune")
     parser.add_argument("--batch", type=int, default=1024)
-    parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--glr", type=float, default=1e-2)
     parser.add_argument("--kimg", type=int, default=2000)
     parser.add_argument("--grad_accum", type=int, default=8)
     parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument('--keep_all_ckpt', action='store_true', help='If set, keep all periodic checkpoints instead of overwriting the latest one.')
+
     opt = parser.parse_args()
 
     # ---------- Setup directories ----------
@@ -142,7 +143,10 @@ def main():
 
         # Save checkpoints periodically
         if batches_done % 50 == 0:
-            ckpt_path = outdir / f"finetuned-g-ani-wrapper-ckpt-{batches_done}.pkl"
+            if opt.keep_all_ckpt:
+                ckpt_path = outdir / f"finetuned-g-ani-wrapper-ckpt-{batches_done:05d}.pkl"
+            else:
+                ckpt_path = outdir / "finetuned-g-ani-wrapper.pkl"
             with open(ckpt_path, "wb") as f:
                 pickle.dump({"ema": ema.cpu(), "g": g_fn.cpu(), "h": h_fn.cpu()}, f)
             print("Saved", ckpt_path)
