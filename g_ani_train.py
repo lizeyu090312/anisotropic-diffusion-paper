@@ -154,7 +154,10 @@ def train(opt):
 
         # checkpoint (same folder as g-only)
         if batches_done % 100 == 0:
-            ckpt_path = outdir / f"finetuned-g-ani-ckpt-{batches_done:05d}.pkl"
+            if opt.keep_all_ckpt:
+                ckpt_path = outdir / f"finetuned-g-ani-ckpt-{batches_done:05d}.pkl"
+            else:
+                ckpt_path = outdir / "finetuned-g-ani.pkl"
             with open(ckpt_path, 'wb') as f:
                 pickle.dump({'model': model.cpu(), 'ema': ema.cpu(), 'g': g_fn.cpu(), "h": h_fn.cpu()}, f)
             print(f"Saved: {ckpt_path}")
@@ -178,6 +181,8 @@ if __name__ == "__main__":
     parser.add_argument("--kimg", type=int, default=1200)
     parser.add_argument("--grad_accum", type=int, default=4)
     parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument('--keep_all_ckpt', action='store_true', help='If set, keep all periodic checkpoints instead of overwriting the latest one.')
+
     args = parser.parse_args()
     train(args)
 
