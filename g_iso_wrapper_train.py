@@ -120,7 +120,7 @@ def main():
                 torch.nan_to_num_(p.grad, nan=0.0, posinf=1e5, neginf=-1e5)
 
         # LR schedule
-        ramp = min(seen / max(lr_rampup_kimg, 1e-8), 1.0)        # linear warm-up
+        ramp = min(seen / max(lr_rampup_kimg * 1000, 1e-8), 1.0)        # linear warm-up
 
         if seen <= total_nimg // 2:                             # no decay first 50 %
             decay = 1.0
