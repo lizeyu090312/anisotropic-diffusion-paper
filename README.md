@@ -5,7 +5,7 @@ We introduce a **trajectory-level framework** that learns matrix-valued diffusio
 \[
 M_t = g(t)V + h(t)(I - V),
 \]
-jointly optimizing both the score network and the anisotropic noise allocation across subspaces.
+jointly optimizing both the score network and the anisotropic noise allocation across subspaces. This repository builds*on top of [NVLabs/EDM (Karras et al., 2022)](https://github.com/NVlabs/edm),
 
 ## Repository Structure
 ```
@@ -24,6 +24,11 @@ anisotropic-diffusion-paper/
 ├── dnnlib/                                         # From NVLabs/edm
 └── train.py, generate.py, fid.py, dataset_tool.py  # From NVLabs/edm
 ```
+
+> **Note:**  
+> The subdirectories `torch_utils/`, `training/`, and `dnnlib/`, as well as several utility scripts  
+> (`train.py`, `generate.py`, `fid.py`, `dataset_tool.py`) are directly inherited from the  
+> [NVLabs/EDM](https://github.com/NVlabs/edm) repository.
 
 ## Usage
 
