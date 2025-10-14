@@ -30,7 +30,7 @@ anisotropic-diffusion-paper/
 
 ### Dataset Preparation
 
-Our dataset preparation follows exactly the same procedure as in the official [NVLabs/EDM dataset setup](https://github.com/NVlabs/edm).
+Our dataset preparation follows exactly the same procedure as in the official [NVLabs/EDM Preparing datasets](https://github.com/NVlabs/edm).
 
 1. Download the original datasets (e.g., CIFAR-10, AFHQv2, FFHQ) from their official websites.
 
