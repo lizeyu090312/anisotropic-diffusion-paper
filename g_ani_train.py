@@ -85,7 +85,7 @@ def train(opt):
     # training hyperparams
     T = 6400.0
     total_nimg = opt.kimg * 1000
-    lr_rampup_kimg = 10_000
+    lr_rampup_kimg = 10
     ema_halflife_kimg = 500
     ema_rampup_ratio = 0.05
 
