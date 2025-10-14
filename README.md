@@ -5,7 +5,7 @@ We introduce a **trajectory-level framework** that learns matrix-valued diffusio
 \[
 M_t = g(t)V + h(t)(I - V),
 \]
-jointly optimizing both the score network and the anisotropic noise allocation across subspaces. This repository builds*on top of [NVLabs/EDM (Karras et al., 2022)](https://github.com/NVlabs/edm),
+jointly optimizing both the score network and the anisotropic noise allocation across subspaces. This repository builds on top of [NVLabs/EDM (Karras et al., 2022)](https://github.com/NVlabs/edm).
 
 ## Repository Structure
 ```
@@ -31,6 +31,33 @@ anisotropic-diffusion-paper/
 > [NVLabs/EDM](https://github.com/NVlabs/edm) repository.
 
 ## Usage
+
+### Dataset Preparation
+
+Our dataset preparation **follows exactly the same procedure as in the official [NVLabs/EDM dataset setup](https://github.com/NVlabs/edm)**.
+
+1. Download the original datasets (e.g., CIFAR-10, AFHQv2, FFHQ) from their official websites.
+
+2. Convert datasets to the desired resolution. Use the EDM utility `dataset_tool.py` to process the downloaded datasets into the resolution  
+   required by our experiments. For example:
+   ```bash
+   # Convert CIFAR-10 images to 32×32
+   python dataset_tool.py --source=<path_to_cifar10_folder> --dest=datasets/cifar10-32x32.zip --resolution=32
+
+   # Convert AFHQv2 images to 64×64
+   python dataset_tool.py --source=<path_to_afhqv2_folder> --dest=datasets/afhqv2-64x64.zip --resolution=64
+
+   # Convert FFHQ images to 64×64
+   python dataset_tool.py --source=<path_to_ffhq_folder> --dest=datasets/ffhq-64x64.zip --resolution=64
+   ```
+
+3. Ensure dataset directory matches training scripts. The training scripts expect the processed datasets to be located under:
+   ```
+   datasets/
+     ├── cifar10-32x32.zip
+     ├── afhqv2-64x64.zip
+     └── ffhq-64x64.zip
+   ```
 
 ### Training
 ```bash
