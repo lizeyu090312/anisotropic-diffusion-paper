@@ -38,8 +38,7 @@ Our dataset preparation follows exactly the same procedure as in the official [N
 
 1. Download the original datasets (e.g., CIFAR-10, AFHQv2, FFHQ) from their official websites.
 
-2. Convert datasets to the desired resolution. Use the EDM utility `dataset_tool.py` to process the downloaded datasets into the resolution  
-   required by our experiments. For example:
+2. Convert datasets to the desired resolution. Use the EDM utility `dataset_tool.py` to process the downloaded datasets into the resolution required by our experiments. For example:
    ```bash
    # Convert CIFAR-10 images to 32×32
    python dataset_tool.py --source=<path_to_cifar10_folder> --dest=datasets/cifar10-32x32.zip --resolution=32
