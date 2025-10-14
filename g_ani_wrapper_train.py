@@ -91,7 +91,7 @@ def main():
                                  betas=(0.9, 0.999), eps=1e-8)
 
     total_nimg = opt.kimg * 1000
-    lr_rampup_kimg = 10_000
+    lr_rampup_kimg = 10
     seen = 0
     running_loss = 0.0
     batches_done = 0
