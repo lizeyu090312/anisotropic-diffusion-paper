@@ -179,7 +179,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--glr", type=float, default=1e-4)  # g,h learning rate
     parser.add_argument("--kimg", type=int, default=1200)
-    parser.add_argument("--grad_accum", type=int, default=4)
+    parser.add_argument("--grad_accum", type=int, default=16)
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument('--keep_all_ckpt', action='store_true', help='If set, keep all periodic checkpoints instead of overwriting the latest one.')
 
