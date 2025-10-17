@@ -1,6 +1,6 @@
 import argparse, pathlib, pickle, torch, tqdm, math, dnnlib, sys, copy
 from torch_utils import misc, persistence
-from common_utils import ANI_absM_Precond_Wrapper, ANILoss_gh_energy_all_version7wud, GFn, compute_DCT_basis
+from common_utils import ANI_absM_Precond_Wrapper, ANILoss_gh_energy_plus_discretization, GFn, compute_DCT_basis
 from data_loader import cifar10_loader, afhqv2_loader, ffhq_loader
 
 # ---------------- Utility ----------------
@@ -137,7 +137,7 @@ def train(opt):
 
         # forward/backward
         for x_chunk, y_chunk in zip(x_chunks, y_chunks):
-            loss = ANILoss_gh_energy_all_version7wud(model, x_chunk, y_chunk, g_fn, h_fn, T=T, tmin=1e-9)
+            loss = ANILoss_gh_energy_plus_discretization(model, x_chunk, y_chunk, g_fn, h_fn, T=T, tmin=1e-9)
             (loss / opt.grad_accum).backward()
             loss_accum += loss.item()
 
