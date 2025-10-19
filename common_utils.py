@@ -566,51 +566,6 @@ def flow_matching_energy(flownet, images, labels, g_fn, h_fn, T, tmin=1e-9):
     return loss
 
 
-# weird implementation quirk, flow_at_x must be computed at x
-def create_flow_derivative_gh_term(flownet, x, gh_t, dot_gh_t, labels, flow_at_x, del_flow_loss):
-    dct_V = flownet.V
-    B,d1,d2,d3 = x.shape
-    d = d1*d2*d3
-    g_t, h_t = gh_t
-    dotg_t, doth_t = dot_gh_t
-    assert g_t.shape[0]==B and h_t.shape[0]==B and dotg_t.shape[0]==B and doth_t.shape[0]==B
-
-    # Sample random perturbation directions ei_s for each x:
-    ei = torch.randn_like(x)
-    ei = ei/ei.norm(p=2,dim=(1,2,3))[:,None,None,None]
-
-    # compute the detached flow, if not provided
-    flow_detached = flow_at_x.detach()
-    del_flow_loss = del_flow_loss.detach()
-
-    # compute del_x <del_flow_loss.detach(), flow(x, gh, label)
-    F_b = (del_flow_loss * flow_at_x).sum()
-    (del_x_F_b,) = torch.autograd.grad(F_b, x, create_graph=True, retain_graph=True)
-    
-    ################################################################
-    # 1. form derivative term involving drds flow(x + rei + sdel_theta M ei)
-    ################################################################
-    dot_del_x_F_b_ei = (del_x_F_b * ei).sum()
-    (del_x_dot_del_x_F_b_ei,) = torch.autograd.grad(dot_del_x_F_b_ei, x, create_graph=False, retain_graph=True)
-    dot_del_x_dot_del_x_F_b_ei_Mei = (del_x_dot_del_x_F_b_ei.detach() * mat_mul((g_t, h_t), dct_V, ei, power=1.0, identity_scaling=0.0)).sum()
-
-    ################################################################
-    # 2. form derivative term involving ds flow(x + sdel_theta M score)
-    ################################################################
-    dot_del_x_F_b_Mscore = (del_x_F_b.detach() * mat_mul((g_t*g_t.detach()**0.5, h_t*h_t.detach()**0.5), dct_V, flow_detached, power=1.0, identity_scaling=0.0)).sum()
-    
-    ################################################################
-    # 3. form derivative term involving dtheta M
-    ################################################################
-    F_c = (del_flow_loss * mat_mul((g_t/g_t.detach(), h_t/h_t.detach()), dct_V, flow_detached, power=1.0, identity_scaling=0.0)).sum()
-
-    ########################################
-    # 4. Combining everything
-    ########################################
-    additional_loss = 0.5 * d * dot_del_x_dot_del_x_F_b_ei_Mei + dot_del_x_F_b_Mscore + 0.5 * F_c
-
-    return additional_loss-additional_loss.detach()
-
 def create_flow_derivative_gh_term(flownet, x, gh_t, dot_gh_t, labels, flow_at_x, del_flow_loss):
     dct_V = flownet.V
     B,d1,d2,d3 = x.shape
