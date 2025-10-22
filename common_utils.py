@@ -528,7 +528,7 @@ class ANI_absM_Precond_Flow_Net(torch.nn.Module):
     def round_sigma(self, sigma):
         return torch.as_tensor(sigma)
     
-def flow_matching_energy(flownet, images, labels, g_fn, h_fn, T, tmin=1e-9):
+def flow_matching_energy(flownet, images, labels, g_fn, h_fn, dataset, T, tmin=1e-9):
     """
     images : [B,C,W,W]  in [-1,1]
     returns scalar mean loss
@@ -539,6 +539,10 @@ def flow_matching_energy(flownet, images, labels, g_fn, h_fn, T, tmin=1e-9):
     g_t, dotg_t = g_fn.g_and_grad(t_vec)
     h_t, doth_t = h_fn.g_and_grad(t_vec)
 
+    if dataset == 'cifar10':
+        c = 0.5
+    else:
+        c = 1
     if labels is not None:
         labels = labels.detach()
     eps = torch.randn_like(images)        
@@ -548,12 +552,12 @@ def flow_matching_energy(flownet, images, labels, g_fn, h_fn, T, tmin=1e-9):
     target_flow = mat_mul((1/(g_t**0.5),1/(h_t**0.5)), flownet.V, images - x_noisy, power=1.0, identity_scaling=0.0) 
 
     # following loss does not back-prop through flownet to get time.
-    flow_error_vec = mat_mul(((dotg_t)/(g_t**0.5)/(g_t+1)**0.5,(doth_t)/(h_t**0.5)/(h_t+1)**0.5), flownet.V, flow_at_x - target_flow, power=1.0, identity_scaling=0.0) 
+    flow_error_vec = mat_mul(((dotg_t)/(g_t**0.5)/(g_t+c)**0.5,(doth_t)/(h_t**0.5)/(h_t+c)**0.5), flownet.V, flow_at_x - target_flow, power=1.0, identity_scaling=0.0) 
     loss = flow_error_vec.pow(2).sum(dim=[1,2,3]).sum()
     
     # now, manually compute del_theta flow(x;theta):
     #del_theta_flow = estimate_flow_derivative_gh(flownet, x_noisy, (g_t, h_t), (dotg_t, doth_t), labels, flow_at_x.detach())
-    del_flow_loss = 2 * mat_mul(((dotg_t**2)/(g_t)/(g_t+1),(doth_t**2)/(h_t)/(h_t+1)), flownet.V, flow_at_x - target_flow, power=1.0, identity_scaling=0.0).detach()
+    del_flow_loss = 2 * mat_mul(((dotg_t**2)/(g_t)/(g_t+c),(doth_t**2)/(h_t)/(h_t+c)), flownet.V, flow_at_x - target_flow, power=1.0, identity_scaling=0.0).detach()
     
     additional_loss = create_flow_derivative_gh_term(flownet, x_noisy, (g_t, h_t), (dotg_t, doth_t), labels, flow_at_x, del_flow_loss)
 
