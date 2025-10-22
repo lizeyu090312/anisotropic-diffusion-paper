@@ -112,7 +112,7 @@ def train(opt):
         y_chunks = [None] * len(x_chunks) if lbls is None else torch.split(lbls, chunk)
 
         for x_chunk, y_chunk in zip(x_chunks, y_chunks):
-            loss = flow_matching_energy(model, x_chunk, y_chunk, g_fn, h_fn, T=T, tmin=1e-9)
+            loss = flow_matching_energy(model, x_chunk, y_chunk, g_fn, h_fn, opt.dataset, T=T, tmin=1e-9)
             (loss / x_chunk.shape[0]).backward()
             loss_accum += (loss / x_chunk.shape[0]).item()
 
