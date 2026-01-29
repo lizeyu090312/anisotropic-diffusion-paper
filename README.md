@@ -1,6 +1,6 @@
-# Trajectory-Optimal Anisotropic Diffusion Models
+# Variational Trajectory Optimization of Anisotropic Diffusion Schedules
 
-Code for **"Trajectory-Optimal Anisotropic Diffusion Models"** .  
+Code for **"Variational Trajectory Optimization of Anisotropic Diffusion Schedules"** .  
 We introduce a **trajectory-level framework** that learns matrix-valued diffusion schedules `M_t = g(t)V + h(t)(I - V)` jointly optimizing both the score network and the anisotropic noise allocation across subspaces. This repository builds on top of [NVLabs/EDM (Karras et al., 2022)](https://github.com/NVlabs/edm).
 
 ## Repository Structure
