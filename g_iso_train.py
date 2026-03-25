@@ -71,6 +71,11 @@ def build_model_and_sched(ckpt_url, V_dim, res, device, T=6400.0, K=32):
     raw = ckpt.get('model', pickle.loads(pickle.dumps(ema)))
     raw = ANI_absM_Precond_Wrapper(raw, dct_V).to(device)
     raw.train()
+    
+    if dataset=='imagenet':
+        ema.use_fp16=False
+        raw.use_fp16=False
+        
     for p in raw.parameters():
         p.requires_grad_(True)
 
@@ -108,7 +113,10 @@ def train(opt):
     T = 6400.0
     total_nimg        = opt.kimg * 1000
     lr_rampup_kimg    = opt.lr_rampup_kimg
-    ema_halflife_kimg = 500
+    if opt.dataset == 'imagenet':
+        ema_halflife_kimg = 50000
+    else:
+        ema_halflife_kimg = 500
     ema_rampup_ratio  = args.ema_rampup_ratio
 
     seen = 0
