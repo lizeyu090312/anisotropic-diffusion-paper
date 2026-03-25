@@ -95,7 +95,10 @@ def train(opt):
     T = 6400.0
     total_nimg = opt.kimg * 1000
     lr_rampup_kimg = opt.lr_rampup_kimg
-    ema_halflife_kimg = 500
+    if opt.dataset == 'imagenet':
+        ema_halflife_kimg = 50000
+    else:
+        ema_halflife_kimg = 500
     ema_rampup_ratio = args.ema_rampup_ratio
 
     seen = 0
