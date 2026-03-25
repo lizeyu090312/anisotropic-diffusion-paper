@@ -1,7 +1,7 @@
 import argparse, pathlib, pickle, torch, tqdm, math, dnnlib, sys, copy
 from torch_utils import misc, persistence
 from common_utils import ANI_absM_Precond_Wrapper, ANILoss_gh_energy, GFn, compute_DCT_basis
-from data_loader import cifar10_loader, afhqv2_loader, ffhq_loader
+from data_loader import cifar10_loader, afhqv2_loader, ffhq_loader, imagenet_loader
 
 # ---------------- Utility ----------------
 class DualWriter:
@@ -107,9 +107,9 @@ def train(opt):
     # training hyperparams
     T = 6400.0
     total_nimg        = opt.kimg * 1000
-    lr_rampup_kimg    = 10
+    lr_rampup_kimg    = opt.lr_rampup_kimg
     ema_halflife_kimg = 500
-    ema_rampup_ratio  = 0.05
+    ema_rampup_ratio  = args.ema_rampup_ratio
 
     seen = 0
     loss_accum = 0.0
@@ -139,6 +139,7 @@ def train(opt):
         for x_chunk, y_chunk in zip(x_chunks, y_chunks):
             loss = ANILoss_gh_energy(model, x_chunk, y_chunk, g_fn, h_fn, T=T, tmin=1e-9)
             (loss / opt.grad_accum).backward()
+            print(loss)
             loss_accum += loss.item()
 
         # sanitize grads
@@ -163,7 +164,8 @@ def train(opt):
 
         # EMA update (with warmup on halflife)
         ema_halflife_nimg = ema_halflife_kimg * 1000
-        ema_halflife_nimg = min(ema_halflife_nimg, seen * ema_rampup_ratio)
+        if ema_rampup_ratio is not None:
+            ema_halflife_nimg = min(ema_halflife_nimg, seen * ema_rampup_ratio)
         ema_beta = 0.5 ** (opt.batch / max(ema_halflife_nimg, 1e-8))
 
         with torch.no_grad():
@@ -183,16 +185,16 @@ def train(opt):
         # periodic checkpoint
         if batches_done % 100 == 0:
             if opt.keep_all_ckpt:
-                ckpt_path = outdir / f"finetuned-g-iso-ckpt-{batches_done:05d}.pkl"
+                ckpt_path = outdir / f"finetuned-g-iso-rampup-{lr_rampup_kimg}-ema-ckpt-{batches_done:05d}.pkl"
             else:
-                ckpt_path = outdir / "finetuned-g-iso.pkl"
+                ckpt_path = outdir / f"finetuned-g-iso-rampup-{lr_rampup_kimg}-ema.pkl"
             with open(ckpt_path, 'wb') as f:
                 pickle.dump({'model': model.cpu(), 'ema': ema.cpu(), 'g': g_fn.cpu()}, f)
             print(f"Saved checkpoint: {ckpt_path}")
             model.to(device); ema.to(device); g_fn.to(device)
 
     # final save
-    final_path = outdir / "finetuned-g-iso.pkl"
+    final_path = outdir / f"finetuned-g-iso-rampup-{lr_rampup_kimg}-ema.pkl"
     with open(final_path, 'wb') as f:
         pickle.dump({'model': model.cpu(), 'ema': ema.cpu(), 'g': g_fn.cpu()}, f)
     print(f"Training finished. Final checkpoint: {final_path}")
@@ -206,7 +208,9 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--glr', type=float, default=1e-2)
     parser.add_argument('--kimg', type=int, default=1200)
-    parser.add_argument('--grad_accum', type=int, default=4)
+    parser.add_argument('--lr_rampup_kimg', type=int, default=10000)
+    parser.add_argument("--ema_rampup_ratio", type=float, default=None)
+    parser.add_argument('--grad_accum', type=int, default=2)
     parser.add_argument('--workers', type=int, default=2)
     parser.add_argument('--keep_all_ckpt', action='store_true', help='If set, keep all periodic checkpoints instead of overwriting the latest one.')
 
