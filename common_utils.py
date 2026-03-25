@@ -2,7 +2,8 @@ import math, torch, torch.nn as nn
 from torch.autograd.functional import jvp as jvp_autograd
 from torch.func import functional_call
 import torch.nn.functional as F
-
+import numpy as np
+from typing import Optional
 class GFn(nn.Module):
     """Scalar variance schedule g(t) with exponential (log‑linear) interpolation.
 
@@ -83,6 +84,283 @@ class GFn(nn.Module):
     def g_and_grad(self, t):
         return self._interp(t)
 
+class GFnInterval(nn.Module):
+    """
+    Scalar variance schedule g(t) with exponential (log-linear) interpolation
+    on a FIXED interval [t_lo, t_hi], with fixed endpoints:
+
+        g(t_lo) = g_lo
+        g(t_hi) = g_hi
+
+    IMPORTANT:
+    - t is still the GLOBAL time variable
+    - g'(t) is derivative w.r.t global t (no time reparameterization)
+    - downstream code can stay unchanged
+    """
+
+    def __init__(
+        self,
+        times: torch.Tensor,   # MUST span [t_lo, t_hi]
+        t_lo: float,
+        t_hi: float,
+        g_lo: float,
+        g_hi: float,
+        initg=None,
+        device="cuda",
+    ):
+        super().__init__()
+
+        # ----------------------------
+        # sanity checks (minimal change)
+        # ----------------------------
+        assert torch.isclose(times[0], torch.tensor(t_lo, dtype=times.dtype)), \
+            "times[0] must be t_lo"
+        assert torch.isclose(times[-1], torch.tensor(t_hi, dtype=times.dtype)), \
+            "times[-1] must be t_hi"
+
+        self.register_buffer("times", times.clone())
+        self.t_lo = t_lo
+        self.t_hi = t_hi
+        self.K = len(times)
+
+        # store fixed endpoint values
+        self.g_lo = float(g_lo)
+        self.g_hi = float(g_hi)
+
+        # ----------------------------
+        # initialization (minimal diff)
+        # ----------------------------
+        if initg is None:
+            # default: log-linear between fixed endpoints
+            g_init = torch.logspace(
+                math.log10(self.g_lo),
+                math.log10(self.g_hi),
+                self.K,
+                device=device,
+            )
+        else:
+            g_init = initg.to(device)
+
+        assert torch.isclose(g_init[0], torch.tensor(self.g_lo, device=device))
+        assert torch.isclose(g_init[-1], torch.tensor(self.g_hi, device=device))
+        assert g_init.shape == times.shape
+
+        log_init = torch.log(g_init)
+
+        # same delta-parameterization as your original GFn
+        delta_init = log_init[1:] - log_init[:-1]
+
+        def _inv_softplus(y):
+            return y + torch.log(-torch.expm1(-y))
+
+        delta_param0 = _inv_softplus(delta_init)
+        self.delta_param = nn.Parameter(delta_param0.clone().detach())
+
+        self.register_buffer("eps", torch.tensor(1e-8, dtype=times.dtype))
+
+        # fixed total log gap (THIS is the crucial fix)
+        self.register_buffer(
+            "total_log_gap",
+            torch.tensor(math.log(self.g_hi) - math.log(self.g_lo), dtype=times.dtype),
+        )
+
+    # ------------------------------------------------------------------
+    # helper: build strictly increasing log_g vector on [t_lo, t_hi]
+    # ------------------------------------------------------------------
+    def _log_knots(self):
+        # fixed starting point
+        log_g0 = torch.tensor(
+            [math.log(self.g_lo)],
+            device=self.times.device,
+        )
+
+        # positive interior increments
+        raw_inc = torch.nn.functional.softplus(self.delta_param) + self.eps
+        S = raw_inc.sum()
+
+        # LOCAL normalization: guarantees g(t_hi) is fixed
+        alpha = self.total_log_gap / S
+        scaled = raw_inc * alpha
+
+        log_g = torch.cumsum(
+            torch.cat([log_g0, scaled]),
+            dim=0,
+        )
+        return log_g  # length K
+
+    # ------------------------------------------------------------------
+    # interpolation (IDENTICAL to your original GFn)
+    # ------------------------------------------------------------------
+    def _interp(self, t: torch.Tensor):
+        logk = self._log_knots()  # (K,)
+        flat = t.flatten()
+
+        idx = torch.searchsorted(self.times, flat, right=False).clamp(1, self.K - 1)
+
+        t0, t1 = self.times[idx - 1], self.times[idx]
+        l0, l1 = logk[idx - 1], logk[idx]
+        w = (flat - t0) / (t1 - t0)
+
+        logg = l0 + w * (l1 - l0)
+        g = torch.exp(logg)
+
+        # derivative w.r.t GLOBAL t (no chain rule!)
+        g_dot = g * (l1 - l0) / (t1 - t0)
+        return g.view_as(t), g_dot.view_as(t)
+
+    # public API (unchanged)
+    def forward(self, t):
+        return self._interp(t)
+
+    def g_and_grad(self, t):
+        return self._interp(t)
+
+class GFnSelector(nn.Module):
+    def __init__(self, g_full, g_mid, t_lo, t_hi):
+        super().__init__()
+        self.g_full = g_full
+        self.g_mid  = g_mid
+        self.t_lo = t_lo
+        self.t_hi = t_hi
+
+    def forward(self, t):
+        g, g_dot = self.g_full(t)
+
+        mask = (t >= self.t_lo) & (t <= self.t_hi)
+        if mask.any():
+            g_m, gdot_m = self.g_mid(t[mask])
+            g = g.clone()
+            g_dot = g_dot.clone()
+            g[mask]     = g_m
+            g_dot[mask] = gdot_m
+
+        return g, g_dot
+
+    def g_and_grad(self, t):
+        return self.forward(t)
+        
+class Free_GFn(nn.Module):
+    """Scalar schedule g(t) with exponential (log-linear) interpolation.
+
+    Changes vs original:
+      - No monotonicity constraint: g(t) may increase or decrease.
+      - No endpoint constraints: g(0) and g(T) are learnable (not fixed).
+      - g(t) is still guaranteed strictly positive.
+
+    Assumes:
+      - times[0] == 0.0 and times[-1] == T
+      - times is strictly increasing (needed for searchsorted)
+    """
+
+    def __init__(self, times: torch.Tensor, T: float, initg=None, g0=1e-9, device=None):
+        super().__init__()
+
+        # Put everything on one device (like your original code intended with `device=...`)
+        if device is None:
+            device = times.device
+        device = torch.device(device)
+        times = times.to(device=device)
+
+        self.register_buffer("times", times.clone())
+        self.T = torch.tensor([T], device=device, dtype=times.dtype)
+        self.K = len(times)
+
+        # Smallest *representable* positive number for this dtype/device.
+        # This is the tightest practical "strictly positive" floor in floating point.
+        zero = torch.zeros((), dtype=times.dtype, device=device)
+        one  = torch.ones((),  dtype=times.dtype, device=device)
+        self.register_buffer("eps", torch.nextafter(zero, one))
+
+        # Keep your original time constraints (not requested to change)
+        assert torch.isclose(self.times[0], torch.tensor(0.0, dtype=times.dtype, device=device)), "times[0] must be 0.0"
+        assert torch.isclose(self.times[-1], torch.tensor(T,   dtype=times.dtype, device=device)), "times[-1] must be T"
+        assert torch.all(self.times[1:] > self.times[:-1]), "times must be strictly increasing"
+
+        # ----- initialization of knot values (ONLY an init, not a constraint) -----
+        if initg is None:
+            # Default init: logspace from g0 to (roughly) T (just an initialization)
+            lo = max(float(g0), float(self.eps.item()))
+            hi = max(float(T), lo * 10.0)  # avoid degenerate hi<=lo
+            g_init = torch.logspace(math.log10(lo), math.log10(hi), self.K,
+                                    device=device, dtype=times.dtype)
+        else:
+            initg = initg.to(device=device, dtype=times.dtype)
+            if initg.shape != self.times.shape:
+                raise ValueError(f"initg must have shape {tuple(self.times.shape)}, got {tuple(initg.shape)}")
+            if not torch.all(initg > 0):
+                raise ValueError("initg must be strictly positive everywhere (log-interpolation requires this).")
+            g_init = initg
+
+        # Work in log-space
+        log_init = torch.log(g_init.clamp_min(self.eps))
+
+        # Learnable: log g(0)
+        self.log_g0 = nn.Parameter(log_init[0:1].clone().detach())  # shape (1,)
+
+        # Learnable: unconstrained log-increments between successive knots
+        # (can be positive or negative => not monotone)
+        delta_init = log_init[1:] - log_init[:-1]                   # shape (K-1,)
+        self.delta_param = nn.Parameter(delta_init.clone().detach())
+
+    # ------------------------------------------------------------------
+    # helper: build log_g knots vector of length K (no monotonic/end constraints)
+    # ------------------------------------------------------------------
+    def _log_knots(self):
+        # log_g[i] = log_g0 + sum_{j< i} delta_param[j]
+        inc = torch.cat([self.log_g0, self.delta_param], dim=0)  # (K,)
+        return torch.cumsum(inc, dim=0)                          # (K,)
+
+    def _interp(self, t: torch.Tensor):
+        logk = self._log_knots()  # (K,)
+
+        # Ensure t is on the module device/dtype for searchsorted math
+        flat = t.to(device=self.times.device, dtype=self.times.dtype).flatten()
+
+        # Find interval index (same logic as your original code)
+        idx = torch.searchsorted(self.times, flat, right=False).clamp(1, self.K - 1)
+
+        t0, t1 = self.times[idx - 1], self.times[idx]
+        l0, l1 = logk[idx - 1], logk[idx]
+        w = (flat - t0) / (t1 - t0)
+
+        # Log-linear interpolation
+        logg = l0 + w * (l1 - l0)
+
+        # Strict positivity guarantee in floating point:
+        # g_raw = exp(logg) can underflow to 0 for very negative logg,
+        # so we add the smallest representable positive eps.
+        g_raw = torch.exp(logg)
+        g = g_raw + self.eps
+
+        # Derivative: d/dt exp(logg(t)) = exp(logg(t)) * d/dt logg(t)
+        # eps is constant so derivative is unchanged by the +eps.
+        g_dot = g_raw * (l1 - l0) / (t1 - t0)
+
+        return g.view_as(t), g_dot.view_as(t)
+
+    # public API
+    def forward(self, t):
+        return self._interp(t)
+
+    def g_and_grad(self, t):
+        return self._interp(t)
+
+    @torch.no_grad()
+    def invert_g(self, y, max_iter=30):
+        """
+        Solve g(t) = y for t in [0, T] by bisection.
+        y: Tensor, same shape as t
+        """
+        t_lo = torch.zeros_like(y)
+        t_hi = torch.full_like(y, self.T.item())
+
+        for _ in range(max_iter):
+            t_mid = 0.5 * (t_lo + t_hi)
+            g_mid, _ = self.g_and_grad(t_mid)
+            t_lo = torch.where(g_mid < y, t_mid, t_lo)
+            t_hi = torch.where(g_mid >= y, t_mid, t_hi)
+
+        return 0.5 * (t_lo + t_hi)
 
 def compute_DCT_basis(k: int, d: int, *, dtype=torch.float32, device="cuda") -> torch.Tensor:
     """
@@ -147,6 +425,61 @@ def mat_mul(gh, V, X, power: float = 1.0, identity_scaling: float = 0.0):
     UX = X - VX                  # U X
     return scale_U * UX + scale_V * VX
 
+def mat_mul_labelwise(
+    gh,
+    V,
+    X,
+    labels=None,
+    power: float = 1.0,
+    identity_scaling: float = 0.0,
+):
+    """
+    Compute (M_t + s·I)^power X, with optional label-aware V.
+
+    gh      : (g_t, h_t), each [B]
+    V       : Tensor [K,W,W] OR Dict[int, Tensor[K,W,W]]
+    X       : [B,C,W,W]
+    labels  : [B] int tensor (required if V is dict)
+    """
+
+    (g_t, h_t) = gh
+    B = X.shape[0]
+
+    assert g_t.numel() == B and h_t.numel() == B
+
+    scale_U = (h_t + identity_scaling).pow(power).view(B,1,1,1)
+    scale_V = (g_t + identity_scaling).pow(power).view(B,1,1,1)
+
+    # ---------------------------------------------------------
+    # Case 1: single global V (old behavior)
+    # ---------------------------------------------------------
+    if not isinstance(V, dict):
+        VX = proj_dct(V, X)
+        UX = X - VX
+        return scale_U * UX + scale_V * VX
+
+    # ---------------------------------------------------------
+    # Case 2: label-aware V (new behavior)
+    # ---------------------------------------------------------
+    assert labels is not None, "labels must be provided when V is a dict"
+    assert labels.shape[0] == B
+
+    VX = torch.zeros_like(X)
+
+    # group by label / basis_id
+    for y in torch.unique(labels):
+        y_int = int(y.item())
+        mask = (labels == y_int)
+        if mask.sum() == 0:
+            continue
+
+        V_y = V[y_int]              # [K,W,W]
+        VX_y = proj_dct(V_y, X[mask])
+        VX[mask] = VX_y
+
+    UX = X - VX
+    return scale_U * UX + scale_V * VX
+
 
 class ANI_absM_Precond_Wrapper(torch.nn.Module):
     def __init__(self,
@@ -182,8 +515,11 @@ class ANI_absM_Precond_Wrapper(torch.nn.Module):
         dtype = (torch.float16
                  if self.use_fp16 and not force_fp32 and x.is_cuda
                  else torch.float32)
+        # if class_labels is not None:
+        #     class_labels = class_labels.to(torch.float32).reshape(-1, self.label_dim)
         if class_labels is not None:
             class_labels = class_labels.to(torch.float32).reshape(-1, self.label_dim)
+
         z_t = mat_mul((1/(g_t+self.sigma_data**2).sqrt(), 1/(h_t+self.sigma_data**2).sqrt()), self.V, x, power = 1.0, identity_scaling = 0.0)
         F_x = self.model(
             z_t.to(dtype),
@@ -201,7 +537,379 @@ class ANI_absM_Precond_Wrapper(torch.nn.Module):
         return D_x
     def round_sigma(self, sigma):
         return torch.as_tensor(sigma) 
-    
+
+class ANI_absM_Precond_Wrapper_basis(torch.nn.Module):
+    def __init__(self, edm_precond, V_global=None, V_by_label=None):
+        super().__init__()
+        # --------- reuse core parameters ----------
+        self.img_resolution = edm_precond.img_resolution
+        self.img_channels   = edm_precond.img_channels
+        self.label_dim      = edm_precond.label_dim
+        self.use_fp16       = edm_precond.use_fp16
+        self.sigma_min      = edm_precond.sigma_min
+        self.sigma_max      = edm_precond.sigma_max
+        self.sigma_data     = edm_precond.sigma_data
+
+        # --------- trained UNet ----------
+        self.model = edm_precond.model
+
+        # --------- basis storage ----------
+        self.V_global   = V_global
+        self.V_by_label = V_by_label
+
+        assert (V_global is not None) or (V_by_label is not None), \
+            "Need either V_global or V_by_label"
+
+        # IMPORTANT: M_EDM_ode expects net.V to exist
+        # initialize with a valid default
+        if self.V_global is not None:
+            self.V = self.V_global
+        else:
+            # pick label 0 as default
+            self.V = self.V_by_label[0]
+
+    @torch.no_grad()
+    def set_V_from_labels(self, class_labels):
+        """
+        Set self.V for the CURRENT batch so that M_EDM_ode can read net.V.
+        Require one-label-per-batch if using V_by_label.
+        """
+        if self.V_by_label is None:
+            self.V = self.V_global
+            return
+
+        assert class_labels is not None, "Per-label PCA requires class_labels"
+
+        if class_labels.ndim > 1:
+            labels_idx = class_labels.argmax(dim=1)
+        else:
+            labels_idx = class_labels
+
+        # enforce single-label-per-batch (required by M_EDM_ode)
+        y0 = int(labels_idx[0].item())
+        if not torch.all(labels_idx == y0):
+            raise RuntimeError(
+                f"Per-label basis requires one label per batch, but got multiple: "
+                f"{torch.unique(labels_idx).tolist()}"
+            )
+
+        self.V = self.V_by_label[y0]
+
+    def forward(self, x, gh, class_labels=None, force_fp32=False, **model_kwargs):
+        x = x.to(torch.float32)
+        g_t, h_t = gh
+
+        # use current self.V (which you should set before calling M_EDM_ode)
+        V = self.V
+
+        sigma_g_t = g_t.sqrt()
+        sigma_h_t = h_t.sqrt()
+        c_noise = (sigma_g_t.log() + sigma_h_t.log()) / 8
+
+        dtype = (torch.float16 if self.use_fp16 and not force_fp32 and x.is_cuda else torch.float32)
+
+        if class_labels is not None:
+            class_labels = class_labels.to(torch.float32).reshape(-1, self.label_dim)
+
+        z_t = mat_mul(
+            (1/(g_t+self.sigma_data**2).sqrt(), 1/(h_t+self.sigma_data**2).sqrt()),
+            V, x, power=1.0, identity_scaling=0.0
+        )
+
+        F_x = self.model(
+            z_t.to(dtype),
+            c_noise.flatten(),
+            class_labels=class_labels,
+            **model_kwargs,
+        ).to(torch.float32)
+
+        c_out_g = g_t.sqrt() * self.sigma_data / (g_t + self.sigma_data**2).sqrt()
+        c_out_h = h_t.sqrt() * self.sigma_data / (h_t + self.sigma_data**2).sqrt()
+        c_out_F_x = mat_mul((c_out_g, c_out_h), V, F_x, power=1.0, identity_scaling=0.0)
+
+        c_skip_g = self.sigma_data**2 / (g_t + self.sigma_data**2)
+        c_skip_h = self.sigma_data**2 / (h_t + self.sigma_data**2)
+        c_skip_x = mat_mul((c_skip_g, c_skip_h), V, x, power=1.0, identity_scaling=0.0)
+
+        D_x = c_skip_x + c_out_F_x
+        return D_x
+
+    def round_sigma(self, sigma):
+        return torch.as_tensor(sigma)
+
+    @torch.no_grad()
+    def set_V_from_label(self, y: int):
+        if self.V_by_label is None:
+            return
+        self.V = self.V_by_label[int(y)]
+
+
+class ANI_absM_Precond_Wrapper_basis_v2(nn.Module):
+    def __init__(self, edm_precond, V_global=None, V_by_label=None):
+        super().__init__()
+
+        # --------- reuse core parameters ----------
+        self.img_resolution = edm_precond.img_resolution
+        self.img_channels   = edm_precond.img_channels
+        self.label_dim      = edm_precond.label_dim
+        self.use_fp16       = edm_precond.use_fp16
+        self.sigma_min      = edm_precond.sigma_min
+        self.sigma_max      = edm_precond.sigma_max
+        self.sigma_data     = edm_precond.sigma_data
+
+        # --------- trained UNet ----------
+        self.model = edm_precond.model
+
+        # --------- basis storage ----------
+        self.V_global   = V_global          # Tensor [r, H, W] or [r, d] etc, or None
+        self.V_by_label = V_by_label        # Dict[int -> V] or None
+
+        assert (V_global is not None) or (V_by_label is not None), \
+            "Need either V_global or V_by_label"
+
+        # --------- IMPORTANT: keep net.V for backward compat ----------
+        # Some old samplers / utilities read net.V directly.
+        if self.V_global is not None:
+            self.V = self.V_global
+        else:
+            # pick an arbitrary default key
+            first_key = next(iter(self.V_by_label.keys()))
+            self.V = self.V_by_label[int(first_key)]
+
+    def forward(
+        self,
+        x,
+        gh,
+        *,
+        V=None,                 # Tensor or Dict[int -> V]
+        labels_id=None,         # Long[B], basis id (required if V is dict)
+        class_labels=None,      # one-hot or embedding
+        force_fp32=False,
+        **model_kwargs,
+    ):
+        """
+        x            : [B,C,H,W]
+        gh           : (g_t[B], h_t[B])
+        V            : Tensor or Dict[basis_id -> V]; if None -> use self.V_global/self.V (compat)
+        labels_id    : Long[B] (required if V is dict)
+        class_labels : conditional UNet input (one-hot)
+        """
+
+        x = x.to(torch.float32)
+        g_t, h_t = gh
+        B = x.shape[0]
+
+        # ------------------------------------------------------------
+        # Choose basis container
+        # ------------------------------------------------------------
+        if V is None:
+            # Backward-compatible path:
+            # - if global exists -> use global
+            # - else use self.V_by_label dict (requires labels_id) OR fallback to self.V (single basis)
+            if self.V_global is not None:
+                V_used = self.V_global
+                labels_id_used = None
+            else:
+                # if dict is available, prefer it (labelwise)
+                if self.V_by_label is not None:
+                    V_used = self.V_by_label
+                    if labels_id is None:
+                        raise RuntimeError(
+                            "V_by_label is provided but labels_id is None. "
+                            "Pass labels_id (basis id per sample), or pass V explicitly."
+                        )
+                    labels_id_used = labels_id
+                else:
+                    V_used = self.V
+                    labels_id_used = None
+        else:
+            V_used = V
+            if isinstance(V_used, dict):
+                if labels_id is None:
+                    raise RuntimeError("labels_id required when V is a dict (basis bank).")
+                labels_id_used = labels_id
+            else:
+                labels_id_used = None  # mat_mul_labelwise ignores labels when V is tensor
+
+        # ------------------------------------------------------------
+        # Noise embedding
+        # ------------------------------------------------------------
+        sigma_g_t = g_t.sqrt()
+        sigma_h_t = h_t.sqrt()
+        c_noise = (sigma_g_t.log() + sigma_h_t.log()) / 8
+
+        dtype = (
+            torch.float16
+            if self.use_fp16 and (not force_fp32) and x.is_cuda
+            else torch.float32
+        )
+
+        if class_labels is not None:
+            class_labels = class_labels.to(torch.float32).reshape(B, self.label_dim)
+
+        # ------------------------------------------------------------
+        # Preconditioning: x -> z_t
+        # ------------------------------------------------------------
+        z_t = mat_mul_labelwise(
+            (
+                1 / (g_t + self.sigma_data**2).sqrt(),
+                1 / (h_t + self.sigma_data**2).sqrt(),
+            ),
+            V_used,
+            x,
+            labels=labels_id_used,
+            power=1.0,
+            identity_scaling=0.0,
+        )
+
+        # ------------------------------------------------------------
+        # UNet (IMPORTANT: do NOT pass V / labels_id into self.model)
+        # ------------------------------------------------------------
+        F_x = self.model(
+            z_t.to(dtype),
+            c_noise.flatten(),
+            class_labels=class_labels,
+            **model_kwargs,
+        ).to(torch.float32)
+
+        # ------------------------------------------------------------
+        # Output projection
+        # ------------------------------------------------------------
+        c_out_g = g_t.sqrt() * self.sigma_data / (g_t + self.sigma_data**2).sqrt()
+        c_out_h = h_t.sqrt() * self.sigma_data / (h_t + self.sigma_data**2).sqrt()
+
+        c_out_F_x = mat_mul_labelwise(
+            (c_out_g, c_out_h),
+            V_used,
+            F_x,
+            labels=labels_id_used,
+            power=1.0,
+            identity_scaling=0.0,
+        )
+
+        c_skip_g = self.sigma_data**2 / (g_t + self.sigma_data**2)
+        c_skip_h = self.sigma_data**2 / (h_t + self.sigma_data**2)
+
+        c_skip_x = mat_mul_labelwise(
+            (c_skip_g, c_skip_h),
+            V_used,
+            x,
+            labels=labels_id_used,
+            power=1.0,
+            identity_scaling=0.0,
+        )
+
+        return c_skip_x + c_out_F_x
+
+    def round_sigma(self, sigma):
+        return torch.as_tensor(sigma)
+
+
+
+# class ANI_absM_Precond_Wrapper_basis_v2(torch.nn.Module):
+#     def __init__(self, edm_precond, V_global=None, V_by_label=None):
+#         super().__init__()
+#         # --------- reuse core parameters ----------
+#         self.img_resolution = edm_precond.img_resolution
+#         self.img_channels   = edm_precond.img_channels
+#         self.label_dim      = edm_precond.label_dim
+#         self.use_fp16       = edm_precond.use_fp16
+#         self.sigma_min      = edm_precond.sigma_min
+#         self.sigma_max      = edm_precond.sigma_max
+#         self.sigma_data     = edm_precond.sigma_data
+
+#         # --------- trained UNet ----------
+#         self.model = edm_precond.model
+
+#         # --------- basis storage ----------
+#         self.V_global   = V_global
+#         self.V_by_label = V_by_label
+
+#         assert (V_global is not None) or (V_by_label is not None), \
+#             "Need either V_global or V_by_label"
+
+#         # IMPORTANT: M_EDM_ode expects net.V to exist
+#         # initialize with a valid default
+#         if self.V_global is not None:
+#             self.V = self.V_global
+#         else:
+#             # pick label 0 as default
+#             self.V = self.V_by_label[0]
+
+#     @torch.no_grad()
+#     def set_V_from_labels(self, class_labels):
+#         """
+#         Set self.V for the CURRENT batch so that M_EDM_ode can read net.V.
+#         Require one-label-per-batch if using V_by_label.
+#         """
+#         if self.V_by_label is None:
+#             self.V = self.V_global
+#             return
+
+#         assert class_labels is not None, "Per-label PCA requires class_labels"
+
+#         if class_labels.ndim > 1:
+#             labels_idx = class_labels.argmax(dim=1)
+#         else:
+#             labels_idx = class_labels
+
+#         # enforce single-label-per-batch (required by M_EDM_ode)
+#         y0 = int(labels_idx[0].item())
+#         if not torch.all(labels_idx == y0):
+#             raise RuntimeError(
+#                 f"Per-label basis requires one label per batch, but got multiple: "
+#                 f"{torch.unique(labels_idx).tolist()}"
+#             )
+
+#         self.V = self.V_by_label[y0]
+
+#     def forward(self, x, gh, class_labels=None, force_fp32=False, **model_kwargs):
+#         x = x.to(torch.float32)
+#         g_t, h_t = gh
+
+#         # use current self.V (which you should set before calling M_EDM_ode)
+#         V = self.V
+
+#         sigma_g_t = g_t.sqrt()
+#         sigma_h_t = h_t.sqrt()
+#         c_noise = (sigma_g_t.log() + sigma_h_t.log()) / 8
+
+#         dtype = (torch.float16 if self.use_fp16 and not force_fp32 and x.is_cuda else torch.float32)
+
+#         if class_labels is not None:
+#             class_labels = class_labels.to(torch.float32).reshape(-1, self.label_dim)
+#             labels_id = class_labels.argmax(dim=1)
+
+#         z_t = mat_mul_labelwise(
+#             (1/(g_t+self.sigma_data**2).sqrt(), 1/(h_t+self.sigma_data**2).sqrt()),
+#             V, x, labels=labels_id, power=1.0, identity_scaling=0.0
+#         )
+
+#         F_x = self.model(
+#             z_t.to(dtype),
+#             c_noise.flatten(),
+#             class_labels=class_labels,
+#             **model_kwargs,
+#         ).to(torch.float32)
+
+#         c_out_g = g_t.sqrt() * self.sigma_data / (g_t + self.sigma_data**2).sqrt()
+#         c_out_h = h_t.sqrt() * self.sigma_data / (h_t + self.sigma_data**2).sqrt()
+#         c_out_F_x = mat_mul_labelwise((c_out_g, c_out_h), V, F_x, labels=labels_id, power=1.0, identity_scaling=0.0)
+
+#         c_skip_g = self.sigma_data**2 / (g_t + self.sigma_data**2)
+#         c_skip_h = self.sigma_data**2 / (h_t + self.sigma_data**2)
+#         c_skip_x = mat_mul_labelwise((c_skip_g, c_skip_h), V, x, labels=labels_id, power=1.0, identity_scaling=0.0)
+#         D_x = c_skip_x + c_out_F_x
+#         return D_x
+
+#     def round_sigma(self, sigma):
+#         return torch.as_tensor(sigma)
+
+#     @torch.no_grad()
+#     def set_V_from_label(self, y: int):
+#         if self.V_by_label is None:
+#             return
+#         self.V = self.V_by_label[int(y)]
 #########
 ## net is ANI_absM_Precond, returns E[x_0]
 #########
@@ -289,6 +997,271 @@ def M_EDM_ode(net, latents, t_vec, g_fn, h_fn, labels):
 
     return x_next
 
+@torch.no_grad()
+def M_EDM_ode_v3(
+    net,
+    latents,
+    t_vec,
+    g_fn,
+    h_fn,
+    labels,          # class one-hot or None
+    *,
+    V,               # Tensor [K,H,W] OR dict[basis_id -> V]
+    labels_id=None,  # Long[B] or None
+):
+    """
+    Label-aware / basis-aware EDM ODE sampler.
+    This version is STATELESS: no net.V mutation.
+    """
+
+    # ------------------------------------------------------------
+    # schedules
+    # ------------------------------------------------------------
+    g, _ = g_fn.g_and_grad(t_vec)
+    h, _ = h_fn.g_and_grad(t_vec)
+
+    g = torch.cat([torch.zeros(1, device=g.device), g]).detach()
+    h = torch.cat([torch.zeros(1, device=h.device), h]).detach()
+
+    # ------------------------------------------------------------
+    # half-step (same as your OPTION 1)
+    # ------------------------------------------------------------
+    t_vec = torch.cat([torch.zeros(1, device=g.device), t_vec])
+    t_half = (t_vec[1:] + t_vec[:-1]) / 2
+    g_half, _ = g_fn.g_and_grad(t_half)
+    h_half, _ = h_fn.g_and_grad(t_half)
+
+    # ------------------------------------------------------------
+    # init
+    # ------------------------------------------------------------
+    x_next = latents * g[-1].sqrt()
+    B = x_next.shape[0]
+
+    # ------------------------------------------------------------
+    # main loop (UNCHANGED numerics)
+    # ------------------------------------------------------------
+    for k in range(g.shape[0] - 1, 0, -1):
+        gk       = g[k].expand(B)
+        hk       = h[k].expand(B)
+        gk_next  = g[k - 1].expand(B)
+        hk_next  = h[k - 1].expand(B)
+        gk_half  = g_half[k - 1].expand(B)
+        hk_half  = h_half[k - 1].expand(B)
+
+        x_hat = x_next
+
+        # --------------------------------------------------------
+        # flow at x_hat
+        # --------------------------------------------------------
+        M_times_score = (
+            net(
+                x_hat,
+                (gk, hk),
+                V=V,
+                labels_id=labels_id,
+                class_labels=labels,
+            )
+            - x_hat
+        )
+
+        flow_dir = mat_mul_labelwise(
+            (gk, hk),
+            V,
+            M_times_score,
+            labels=labels_id,
+            power=-0.5,
+            identity_scaling=0.0,
+        )
+
+        # --------------------------------------------------------
+        # half step
+        # --------------------------------------------------------
+        x_half = x_hat + mat_mul_labelwise(
+            (gk_half.sqrt() - gk.sqrt(),
+             hk_half.sqrt() - hk.sqrt()),
+            V,
+            -flow_dir,
+            labels=labels_id,
+            power=1.0,
+            identity_scaling=0.0,
+        )
+
+        # --------------------------------------------------------
+        # Heun correction
+        # --------------------------------------------------------
+        if k - 1 > 0:
+            M_times_score_half = (
+                net(
+                    x_half,
+                    (gk_half, hk_half),
+                    V=V,
+                    labels_id=labels_id,
+                    class_labels=labels,
+                )
+                - x_half
+            )
+
+            flow_dir_half = mat_mul_labelwise(
+                (gk_half, hk_half),
+                V,
+                M_times_score_half,
+                labels=labels_id,
+                power=-0.5,
+                identity_scaling=0.0,
+            )
+
+            ratio_g = (gk_next.sqrt() - gk.sqrt()) / (gk_half.sqrt() - gk.sqrt())
+            ratio_h = (hk_next.sqrt() - hk.sqrt()) / (hk_half.sqrt() - hk.sqrt())
+
+            delta_flow_dir = mat_mul_labelwise(
+                (ratio_g, ratio_h),
+                V,
+                (flow_dir_half - flow_dir),
+                labels=labels_id,
+                power=1.0,
+                identity_scaling=0.0,
+            )
+
+            x_next = x_hat + mat_mul_labelwise(
+                (gk_next.sqrt() - gk.sqrt(),
+                 hk_next.sqrt() - hk.sqrt()),
+                V,
+                -(flow_dir + 0.5 * delta_flow_dir),
+                labels=labels_id,
+                power=1.0,
+                identity_scaling=0.0,
+            )
+        else:
+            x_next = x_half
+
+    return x_next
+
+def M_EDM_ode_next(net, latents, t_vec, g_fn, h_fn, labels):
+    g, _ = g_fn.g_and_grad(t_vec)
+    h, _ = h_fn.g_and_grad(t_vec)
+    
+    #optional
+    g = torch.cat([torch.zeros(1,device=g.device), g])
+    h = torch.cat([torch.zeros(1,device=h.device), h])
+    g = g.detach()
+    h = h.detach()
+
+
+    ### OPTION 1: average in t space
+    # t_vec = torch.cat([torch.zeros(1,device=g.device), t_vec])
+    # t_half = (t_vec[1:]+t_vec[:-1])/2
+    # g_half, _ = g_fn.g_and_grad(t_half)
+    # #g_half = torch.cat([g[1].unsqueeze(0)*0.5, g_half])
+    # h_half, _ = h_fn.g_and_grad(t_half)
+    #h_half = torch.cat([h[1].unsqueeze(0)*0.5, h_half])
+    
+    ### OPTION 2: average in sqrt space
+    #g_half = ((g[1:].sqrt()+g[:-1].sqrt())/2)**2
+    #h_half = ((h[1:].sqrt()+h[:-1].sqrt())/2)**2
+
+    ### OPTION 3: same as EDM
+    g_half = g[:-1]
+    h_half = h[:-1]
+
+    # Main sampling loop.
+    x_next = latents * g[-1].sqrt()
+    B = x_next.shape[0]
+
+    with torch.no_grad():
+        for k in range(g.shape[0]-1,0,-1):
+            gk = g[k].unsqueeze(0).expand(B)
+            hk = h[k].unsqueeze(0).expand(B)
+            gk_next = g[k-1].unsqueeze(0).expand(B)
+            hk_next = h[k-1].unsqueeze(0).expand(B)
+            gk_half = g_half[k-1].unsqueeze(0).expand(B)
+            hk_half = h_half[k-1].unsqueeze(0).expand(B)
+            
+            x_cur = x_next
+            x_hat = x_cur
+        
+            M_times_score = net(x_hat, (gk,hk), class_labels=labels) - x_hat
+            flow_dir = mat_mul((gk, hk), net.V, M_times_score, power = -0.5, identity_scaling = 0)
+            
+            x_half = x_hat + mat_mul((gk_half.sqrt() - gk.sqrt(), hk_half.sqrt() - hk.sqrt()), 
+                              net.V, -flow_dir, power = 1.0, identity_scaling = 0)
+            
+            if k-1 > 0:
+                M_times_score_half = net(x_half, (gk_half,hk_half), class_labels=labels) - x_half
+                flow_dir_half = mat_mul((gk_half, hk_half), net.V, M_times_score_half, power = -0.5, identity_scaling = 0)
+                ratio_g = (gk_next.sqrt() - gk.sqrt())/(gk_half.sqrt() - gk.sqrt())
+                ratio_h = (hk_next.sqrt() - hk.sqrt())/(hk_half.sqrt() - hk.sqrt())
+                delta_flow_dir = mat_mul((ratio_g, ratio_h), net.V, (flow_dir_half - flow_dir))
+
+                x_next = x_hat + mat_mul((gk_next.sqrt() - gk.sqrt(), hk_next.sqrt() - hk.sqrt()), 
+                                  net.V, -(flow_dir + 0.5*delta_flow_dir))
+            else:
+                x_next = x_half
+
+    return x_next
+
+def M_EDM_ode_mid(net, latents, t_vec, g_fn, h_fn, g_fn_mid, h_fn_mid, labels):
+    g, _ = g_fn.g_and_grad(t_vec)
+    h, _ = h_fn.g_and_grad(t_vec)
+    
+    #optional
+    g = torch.cat([torch.zeros(1,device=g.device), g])
+    h = torch.cat([torch.zeros(1,device=h.device), h])
+    g = g.detach()
+    h = h.detach()
+
+
+    ### OPTION 1: average in t space
+    t_vec = torch.cat([torch.zeros(1,device=g.device), t_vec])
+    t_half = (t_vec[1:]+t_vec[:-1])/2
+    g_half, _ = g_fn_mid.g_and_grad(t_half)
+    #g_half = torch.cat([g[1].unsqueeze(0)*0.5, g_half])
+    h_half, _ = h_fn_mid.g_and_grad(t_half)
+    #h_half = torch.cat([h[1].unsqueeze(0)*0.5, h_half])
+    
+    ### OPTION 2: average in sqrt space
+    #g_half = ((g[1:].sqrt()+g[:-1].sqrt())/2)**2
+    #h_half = ((h[1:].sqrt()+h[:-1].sqrt())/2)**2
+
+    ### OPTION 3: same as EDM
+    #g_half = g[:-1]
+    #h_half = h[:-1]
+
+    # Main sampling loop.
+    x_next = latents * g[-1].sqrt()
+    B = x_next.shape[0]
+
+    with torch.no_grad():
+        for k in range(g.shape[0]-1,0,-1):
+            gk = g[k].unsqueeze(0).expand(B)
+            hk = h[k].unsqueeze(0).expand(B)
+            gk_next = g[k-1].unsqueeze(0).expand(B)
+            hk_next = h[k-1].unsqueeze(0).expand(B)
+            gk_half = g_half[k-1].unsqueeze(0).expand(B)
+            hk_half = h_half[k-1].unsqueeze(0).expand(B)
+            
+            x_cur = x_next
+            x_hat = x_cur
+        
+            M_times_score = net(x_hat, (gk,hk), class_labels=labels) - x_hat
+            flow_dir = mat_mul((gk, hk), net.V, M_times_score, power = -0.5, identity_scaling = 0)
+            
+            x_half = x_hat + mat_mul((gk_half.sqrt() - gk.sqrt(), hk_half.sqrt() - hk.sqrt()), 
+                              net.V, -flow_dir, power = 1.0, identity_scaling = 0)
+            
+            if k-1 > 0:
+                M_times_score_half = net(x_half, (gk_half,hk_half), class_labels=labels) - x_half
+                flow_dir_half = mat_mul((gk_half, hk_half), net.V, M_times_score_half, power = -0.5, identity_scaling = 0)
+                ratio_g = (gk_next.sqrt() - gk.sqrt())/(gk_half.sqrt() - gk.sqrt())
+                ratio_h = (hk_next.sqrt() - hk.sqrt())/(hk_half.sqrt() - hk.sqrt())
+                delta_flow_dir = mat_mul((ratio_g, ratio_h), net.V, (flow_dir_half - flow_dir))
+
+                x_next = x_hat + mat_mul((gk_next.sqrt() - gk.sqrt(), hk_next.sqrt() - hk.sqrt()), 
+                                  net.V, -(flow_dir + 0.5*delta_flow_dir))
+            else:
+                x_next = x_half
+
+    return x_next
+
 def ANILoss_gh_energy(edmnet, images, labels, g_fn, h_fn, T, tmin=1e-9):
     """
     images : [B,C,W,W]  in [-1,1]
@@ -316,6 +1289,134 @@ def ANILoss_gh_energy(edmnet, images, labels, g_fn, h_fn, T, tmin=1e-9):
 
     weighted_diff = mat_mul(((dot_g**2)/(g**2)/(g+sigma_data**2),(dot_h**2)/(h**2)/(h+sigma_data**2)), edmnet.V, diff, power=0.5, identity_scaling=0.0) 
     loss = weighted_diff.pow(2).sum(dim=[1,2,3])
+
+    return loss.mean()
+
+def ANILoss_gh_energy_condition(edmnet, images, labels, g_fn, h_fn, T, tmin=1e-9, class_ids=None):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns per-pixel squared error tensor (identical convention as EDMLoss)
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    # g, dot_g = g_fn.g_and_grad(t_vec)
+    # h, dot_h = h_fn.g_and_grad(t_vec)
+    is_dict = isinstance(g_fn, (dict, torch.nn.ModuleDict))
+    if is_dict:
+        assert class_ids is not None, "When g_fn is dict/ModuleDict, please pass class_ids (LongTensor [B])."
+        # allocate
+        g_t    = torch.empty(B, device=device, dtype=torch.float32)
+        dotg_t = torch.empty(B, device=device, dtype=torch.float32)
+        h_t    = torch.empty(B, device=device, dtype=torch.float32)
+        doth_t = torch.empty(B, device=device, dtype=torch.float32)
+
+        for lbl in class_ids.unique():
+            lbl_int = int(lbl.item())
+            mask = (class_ids == lbl_int)
+            if not mask.any():
+                continue
+            key = str(lbl_int)
+
+            g_t_m, dotg_t_m = g_fn[key].g_and_grad(t_vec[mask])
+            h_t_m, doth_t_m = h_fn[key].g_and_grad(t_vec[mask])
+
+            g_t[mask]    = g_t_m
+            dotg_t[mask] = dotg_t_m
+            h_t[mask]    = h_t_m
+            doth_t[mask] = doth_t_m
+
+    else:
+        g_t, dotg_t = g_fn.g_and_grad(t_vec)
+        h_t, doth_t = h_fn.g_and_grad(t_vec)
+
+    g = g_t
+    h = h_t
+    dot_g = dotg_t
+    dot_h = doth_t
+
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)        #eps ~ N(0,I)
+    x_noisy = images + mat_mul((g,h), edmnet.V, eps, power=0.5, identity_scaling=0.0)
+    den = edmnet(x_noisy, (g,h), class_labels=labels)
+    diff = den - images     # model residual
+
+    sigma_data = 1
+
+    weighted_diff = mat_mul(((dot_g**2)/(g**2)/(g+sigma_data**2),(dot_h**2)/(h**2)/(h+sigma_data**2)), edmnet.V, diff, power=0.5, identity_scaling=0.0) 
+    loss = weighted_diff.pow(2).sum(dim=[1,2,3])
+
+    return loss.mean()
+
+@torch.no_grad()
+def sample_from_GFn(g_fn, N, device='cuda', gmin=1e-8, gmax=6400.0):
+    rand_t = torch.rand(N, device=device) * (gmax - gmin) + gmin
+    g_t, dotg_t = g_fn(rand_t)
+
+    # weight used in your original loss
+    weight_t = (dotg_t ** 2) / (g_t * (1.0 + g_t))
+
+    return g_t.detach(), weight_t.detach()
+
+def build_g_sampler_from_histogram(logg, weights, bins, gmin=1e-8, gmax=6400.0):
+    hist, bin_edges = np.histogram(
+        logg,
+        bins=bins,
+        range=(math.log(gmin), math.log(gmax)),
+        weights=weights,
+        density=True
+    )
+
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    prob = hist / hist.sum()
+    cdf = np.cumsum(prob)
+
+    return {
+        "logg_bins": bin_centers,
+        "cdf": cdf,
+    }
+
+class GSamplerFromHistogram:
+    def __init__(self, sampler_state):
+        self.logg_bins = sampler_state["logg_bins"]
+        self.cdf = sampler_state["cdf"]
+
+    def __call__(self, B, device):
+        u = np.random.rand(B)
+        idx = np.searchsorted(self.cdf, u)
+        idx = np.clip(idx, 0, len(self.logg_bins) - 1)
+
+        logg = self.logg_bins[idx]
+        g = torch.from_numpy(np.exp(logg)).to(device).float()
+
+        # g-iso case
+        h = g.clone()
+        return g, h
+
+
+def ANILoss_gh_energy_hist(edmnet, images, labels, g_sampler):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns per-pixel squared error tensor (identical convention as EDMLoss)
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+
+    g, h = g_sampler(B, device)
+
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)        #eps ~ N(0,I)
+    x_noisy = images + mat_mul((g,h), edmnet.V, eps, power=0.5, identity_scaling=0.0)
+    den = edmnet(x_noisy, (g,h), class_labels=labels)
+    diff = den - images     # model residual
+
+    # sigma_data = 1
+
+    # weighted_diff = mat_mul(((dot_g**2)/(g**2)/(g+sigma_data**2),(dot_h**2)/(h**2)/(h+sigma_data**2)), edmnet.V, diff, power=0.5, identity_scaling=0.0) 
+    loss = diff.pow(2).sum(dim=[1,2,3])/g
 
     return loss.mean()
 
@@ -364,7 +1465,7 @@ def ANILoss_gh_energy_plus_discretization(edmnet, images, labels, g_fn, h_fn, T,
     t_vec_target = torch.clamp(t_vec - delta, min=1e-9, max=6400)
 
     t_vec_next = t_vec + 0.5 * (t_vec_target - t_vec)
-
+    
     g_next, _ = g_fn.g_and_grad(t_vec_next)
     h_next, _ = h_fn.g_and_grad(t_vec_next)
 
@@ -405,7 +1506,708 @@ def ANILoss_gh_energy_plus_discretization(edmnet, images, labels, g_fn, h_fn, T,
     loss = loss + disc_err.norm(p=2,dim=[1,2,3]).pow(2).mean()
     return loss
 
+def ANILoss_gh_energy_plus_discretization_todo1_fixHalf(edmnet, images, labels, g_fn, h_fn, T, tmin=1e-9, disc_mult=1.0):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns per-pixel squared error tensor (identical convention as EDMLoss)
+    """
+    B, _, _, _ = images.shape
+    device = images.device
 
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g, dot_g = g_fn.g_and_grad(t_vec)
+    h, dot_h = h_fn.g_and_grad(t_vec)
+
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)        #eps ~ N(0,I)
+    x_noisy = images + mat_mul((g,h), edmnet.V, eps, power=0.5, identity_scaling=0.0)
+    
+    #####################
+    ### compute detached score
+    #####################
+    detached = {k: v.detach() for k,v in edmnet.named_parameters()}
+    M_times_score_detached = functional_call(edmnet, detached, (x_noisy, (g, h)),
+                         {"class_labels": labels}) - x_noisy
+    
+    #####################
+    ### dotgsqogsqogp1: loss wrt true score  (3.1 FID)
+    #####################
+    scaled_net_score = mat_mul((dot_g/(g)/((g+0.5)**0.5),dot_h/(h)/((h+0.5)**0.5)), edmnet.V, M_times_score_detached) 
+    scaled_true_noisy_score = mat_mul((dot_g/(g)/((g+0.5)**0.5),dot_h/(h)/((h+0.5)**0.5)), edmnet.V, images-x_noisy) 
+
+    loss = (scaled_true_noisy_score - scaled_net_score).pow(2).sum(dim=[1,2,3]).mean() 
+
+    loss = loss - (scaled_true_noisy_score).pow(2).sum(dim=[1,2,3]).mean() + (scaled_net_score).pow(2).sum(dim=[1,2,3]).mean()
+
+    loss = loss
+
+    #####################
+    ### loss wrt discretization
+    #####################
+    interval = 6400.0/8
+    delta = (torch.rand(t_vec.shape,device=device)) * interval
+    #delta = (torch.rand(t_vec.shape,device=device)*0.5+0.5) * interval
+    t_vec_target = torch.clamp(t_vec - delta, min=1e-9, max=6400)
+
+    t_vec_next = t_vec + 0.5 * (t_vec_target - t_vec)
+    
+    g_next, _ = g_fn.g_and_grad(t_vec_next)
+    h_next, _ = h_fn.g_and_grad(t_vec_next)
+
+    t_rand_mid = t_vec + torch.rand(t_vec.shape,device=device) * (t_vec_target - t_vec) 
+    g_rand_mid, dotg_rand_mid = g_fn.g_and_grad(t_rand_mid)
+    h_rand_mid, doth_rand_mid = h_fn.g_and_grad(t_rand_mid)
+    
+    #g_next = (g.sqrt()-(dot_g/g.sqrt() *delta))**2
+    #h_next = (h.sqrt()-(dot_h/h.sqrt() *delta))**2
+    
+    # compute update direction
+    flow_dir = mat_mul((g, h), edmnet.V, M_times_score_detached, power = -0.5)
+    x_next = x_noisy + mat_mul((g_next.sqrt() - g.sqrt(), h_next.sqrt() - h.sqrt()), 
+                      edmnet.V, -flow_dir, power = 1.0)
+    M_times_score_next_detached = functional_call(edmnet, detached, (x_next, (g_next, h_next)),
+                         {"class_labels": labels}) - x_next
+    flow_dir_next = mat_mul((g_next, h_next), edmnet.V, M_times_score_next_detached, power = -0.5)
+
+    # estimate d/ds flow
+    # wrong: dt_flow_dir = mat_mul((1/(g_next.sqrt()-g.sqrt()),1/(h_next.sqrt()-h.sqrt())), edmnet.V, 0.5 * (flow_dir_next - flow_dir)) 
+    # michael todo 1: check if code works better after bugfix below:
+    dt_flow_dir = mat_mul((1/(g_next.sqrt()-g.sqrt()),1/(h_next.sqrt()-h.sqrt())), edmnet.V, (flow_dir_next - flow_dir)) 
+
+    #disc_err = mat_mul(((dot_g)/(g**0.5)/((g+1)**0.5),(dot_h)/(h**0.5)/((h+1)**0.5)), edmnet.V, (flow_dir - flow_dir_next)) 
+
+    displacement_at_t_mid = (mat_mul((g_rand_mid.sqrt()-g.sqrt(),h_rand_mid.sqrt()-h.sqrt()), edmnet.V, - flow_dir) 
+                     + mat_mul(((g_rand_mid.sqrt()-g.sqrt())**2,(h_rand_mid.sqrt()-h.sqrt())**2), edmnet.V, - 0.5 * dt_flow_dir))
+    x_rand_mid = x_noisy + displacement_at_t_mid
+    
+    velocity_at_t_mid = mat_mul((dotg_rand_mid/(g_rand_mid**0.5),doth_rand_mid/(h_rand_mid**0.5)), edmnet.V, 
+                     - flow_dir + mat_mul(((g_rand_mid.sqrt()-g.sqrt()),(h_rand_mid.sqrt()-h.sqrt())), edmnet.V, - dt_flow_dir))
+
+    M_times_score_rand_mid = functional_call(edmnet, detached, (x_rand_mid, (g_rand_mid, h_rand_mid)),
+                         {"class_labels": labels}) - x_rand_mid
+    
+    true_velocity_at_t_mid = mat_mul((dotg_rand_mid/g_rand_mid,doth_rand_mid/h_rand_mid), edmnet.V, - M_times_score_rand_mid) 
+
+    disc_err = mat_mul((1/(g_rand_mid+0.5)**0.5,1/(h_rand_mid+0.5)**0.5), edmnet.V, velocity_at_t_mid - true_velocity_at_t_mid)
+    
+    loss = loss + disc_err.norm(p=2,dim=[1,2,3]).pow(2).mean()
+    return loss
+
+
+def ANILoss_gh_energy_plus_discretization_todo2_fixHalf_NoScoreMatchLoss(edmnet, images, labels, g_fn, h_fn, T, tmin=1e-9, disc_mult=1.0):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns per-pixel squared error tensor (identical convention as EDMLoss)
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g, dot_g = g_fn.g_and_grad(t_vec)
+    h, dot_h = h_fn.g_and_grad(t_vec)
+
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)        #eps ~ N(0,I)
+    x_noisy = images + mat_mul((g,h), edmnet.V, eps, power=0.5, identity_scaling=0.0)
+    
+    #####################
+    ### compute detached score
+    #####################
+    detached = {k: v.detach() for k,v in edmnet.named_parameters()}
+    M_times_score_detached = functional_call(edmnet, detached, (x_noisy, (g, h)),
+                         {"class_labels": labels}) - x_noisy
+    
+    #####################
+    ### dotgsqogsqogp1: loss wrt true score  (3.1 FID)
+    #####################
+    loss = 0
+
+    #####################
+    ### loss wrt discretization
+    #####################
+    interval = 6400.0/8
+    delta = (torch.rand(t_vec.shape,device=device)) * interval
+    #delta = (torch.rand(t_vec.shape,device=device)*0.5+0.5) * interval
+    t_vec_target = torch.clamp(t_vec - delta, min=1e-9, max=6400)
+
+    t_vec_next = t_vec + 0.5 * (t_vec_target - t_vec)
+    
+    g_next, _ = g_fn.g_and_grad(t_vec_next)
+    h_next, _ = h_fn.g_and_grad(t_vec_next)
+
+    t_rand_mid = t_vec + torch.rand(t_vec.shape,device=device) * (t_vec_target - t_vec) 
+    g_rand_mid, dotg_rand_mid = g_fn.g_and_grad(t_rand_mid)
+    h_rand_mid, doth_rand_mid = h_fn.g_and_grad(t_rand_mid)
+    
+    #g_next = (g.sqrt()-(dot_g/g.sqrt() *delta))**2
+    #h_next = (h.sqrt()-(dot_h/h.sqrt() *delta))**2
+    
+    # compute update direction
+    flow_dir = mat_mul((g, h), edmnet.V, M_times_score_detached, power = -0.5)
+    x_next = x_noisy + mat_mul((g_next.sqrt() - g.sqrt(), h_next.sqrt() - h.sqrt()), 
+                      edmnet.V, -flow_dir, power = 1.0)
+    M_times_score_next_detached = functional_call(edmnet, detached, (x_next, (g_next, h_next)),
+                         {"class_labels": labels}) - x_next
+    flow_dir_next = mat_mul((g_next, h_next), edmnet.V, M_times_score_next_detached, power = -0.5)
+
+    # estimate d/ds flow
+    # wrong: dt_flow_dir = mat_mul((1/(g_next.sqrt()-g.sqrt()),1/(h_next.sqrt()-h.sqrt())), edmnet.V, 0.5 * (flow_dir_next - flow_dir)) 
+    # michael todo 1: check if code works better after bugfix below:
+    dt_flow_dir = mat_mul((1/(g_next.sqrt()-g.sqrt()),1/(h_next.sqrt()-h.sqrt())), edmnet.V, (flow_dir_next - flow_dir)) 
+
+    #disc_err = mat_mul(((dot_g)/(g**0.5)/((g+1)**0.5),(dot_h)/(h**0.5)/((h+1)**0.5)), edmnet.V, (flow_dir - flow_dir_next)) 
+
+    displacement_at_t_mid = (mat_mul((g_rand_mid.sqrt()-g.sqrt(),h_rand_mid.sqrt()-h.sqrt()), edmnet.V, - flow_dir) 
+                     + mat_mul(((g_rand_mid.sqrt()-g.sqrt())**2,(h_rand_mid.sqrt()-h.sqrt())**2), edmnet.V, - 0.5 * dt_flow_dir))
+    x_rand_mid = x_noisy + displacement_at_t_mid
+    
+    velocity_at_t_mid = mat_mul((dotg_rand_mid/(g_rand_mid**0.5),doth_rand_mid/(h_rand_mid**0.5)), edmnet.V, 
+                     - flow_dir + mat_mul(((g_rand_mid.sqrt()-g.sqrt()),(h_rand_mid.sqrt()-h.sqrt())), edmnet.V, - dt_flow_dir))
+
+    M_times_score_rand_mid = functional_call(edmnet, detached, (x_rand_mid, (g_rand_mid, h_rand_mid)),
+                         {"class_labels": labels}) - x_rand_mid
+    
+    true_velocity_at_t_mid = mat_mul((dotg_rand_mid/g_rand_mid,doth_rand_mid/h_rand_mid), edmnet.V, - M_times_score_rand_mid) 
+
+    disc_err = mat_mul((1/(g_rand_mid+0.5)**0.5,1/(h_rand_mid+0.5)**0.5), edmnet.V, velocity_at_t_mid - true_velocity_at_t_mid)
+    
+    loss = loss + disc_err.norm(p=2,dim=[1,2,3]).pow(2).mean()
+    return loss
+
+
+def ANILoss_gh_energy_plus_discretization_todo3_fixHalf_and_diffK(edmnet, images, labels, g_fn, h_fn, T, tmin=1e-9, disc_mult=1.0):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns per-pixel squared error tensor (identical convention as EDMLoss)
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g, dot_g = g_fn.g_and_grad(t_vec)
+    h, dot_h = h_fn.g_and_grad(t_vec)
+
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)        #eps ~ N(0,I)
+    x_noisy = images + mat_mul((g,h), edmnet.V, eps, power=0.5, identity_scaling=0.0)
+    
+    #####################
+    ### compute detached score
+    #####################
+    detached = {k: v.detach() for k,v in edmnet.named_parameters()}
+    M_times_score_detached = functional_call(edmnet, detached, (x_noisy, (g, h)),
+                         {"class_labels": labels}) - x_noisy
+    
+    #####################
+    ### dotgsqogsqogp1: loss wrt true score  (3.1 FID)
+    #####################
+    scaled_net_score = mat_mul((dot_g/(g)/((g+0.5)**0.5),dot_h/(h)/((h+0.5)**0.5)), edmnet.V, M_times_score_detached) 
+    scaled_true_noisy_score = mat_mul((dot_g/(g)/((g+0.5)**0.5),dot_h/(h)/((h+0.5)**0.5)), edmnet.V, images-x_noisy) 
+
+    loss = (scaled_true_noisy_score - scaled_net_score).pow(2).sum(dim=[1,2,3]).mean() 
+
+    loss = loss - (scaled_true_noisy_score).pow(2).sum(dim=[1,2,3]).mean() + (scaled_net_score).pow(2).sum(dim=[1,2,3]).mean()
+
+    loss = loss
+
+    #####################
+    ### loss wrt discretization
+    #####################
+    interval = 6400.0/interval_K
+    delta = (torch.rand(t_vec.shape,device=device)) * interval
+    #delta = (torch.rand(t_vec.shape,device=device)*0.5+0.5) * interval
+    t_vec_target = torch.clamp(t_vec - delta, min=1e-9, max=6400)
+
+    t_vec_next = t_vec + 0.5 * (t_vec_target - t_vec)
+    
+    g_next, _ = g_fn.g_and_grad(t_vec_next)
+    h_next, _ = h_fn.g_and_grad(t_vec_next)
+
+    t_rand_mid = t_vec + torch.rand(t_vec.shape,device=device) * (t_vec_target - t_vec) 
+    g_rand_mid, dotg_rand_mid = g_fn.g_and_grad(t_rand_mid)
+    h_rand_mid, doth_rand_mid = h_fn.g_and_grad(t_rand_mid)
+    
+    #g_next = (g.sqrt()-(dot_g/g.sqrt() *delta))**2
+    #h_next = (h.sqrt()-(dot_h/h.sqrt() *delta))**2
+    
+    # compute update direction
+    flow_dir = mat_mul((g, h), edmnet.V, M_times_score_detached, power = -0.5)
+    x_next = x_noisy + mat_mul((g_next.sqrt() - g.sqrt(), h_next.sqrt() - h.sqrt()), 
+                      edmnet.V, -flow_dir, power = 1.0)
+    M_times_score_next_detached = functional_call(edmnet, detached, (x_next, (g_next, h_next)),
+                         {"class_labels": labels}) - x_next
+    flow_dir_next = mat_mul((g_next, h_next), edmnet.V, M_times_score_next_detached, power = -0.5)
+
+    # estimate d/ds flow
+    # wrong: dt_flow_dir = mat_mul((1/(g_next.sqrt()-g.sqrt()),1/(h_next.sqrt()-h.sqrt())), edmnet.V, 0.5 * (flow_dir_next - flow_dir)) 
+    # michael todo 1: check if code works better after bugfix below:
+    dt_flow_dir = mat_mul((1/(g_next.sqrt()-g.sqrt()),1/(h_next.sqrt()-h.sqrt())), edmnet.V, (flow_dir_next - flow_dir)) 
+
+    #disc_err = mat_mul(((dot_g)/(g**0.5)/((g+1)**0.5),(dot_h)/(h**0.5)/((h+1)**0.5)), edmnet.V, (flow_dir - flow_dir_next)) 
+
+    displacement_at_t_mid = (mat_mul((g_rand_mid.sqrt()-g.sqrt(),h_rand_mid.sqrt()-h.sqrt()), edmnet.V, - flow_dir) 
+                     + mat_mul(((g_rand_mid.sqrt()-g.sqrt())**2,(h_rand_mid.sqrt()-h.sqrt())**2), edmnet.V, - 0.5 * dt_flow_dir))
+    x_rand_mid = x_noisy + displacement_at_t_mid
+    
+    velocity_at_t_mid = mat_mul((dotg_rand_mid/(g_rand_mid**0.5),doth_rand_mid/(h_rand_mid**0.5)), edmnet.V, 
+                     - flow_dir + mat_mul(((g_rand_mid.sqrt()-g.sqrt()),(h_rand_mid.sqrt()-h.sqrt())), edmnet.V, - dt_flow_dir))
+
+    M_times_score_rand_mid = functional_call(edmnet, detached, (x_rand_mid, (g_rand_mid, h_rand_mid)),
+                         {"class_labels": labels}) - x_rand_mid
+    
+    true_velocity_at_t_mid = mat_mul((dotg_rand_mid/g_rand_mid,doth_rand_mid/h_rand_mid), edmnet.V, - M_times_score_rand_mid) 
+
+    disc_err = mat_mul((1/(g_rand_mid+0.5)**0.5,1/(h_rand_mid+0.5)**0.5), edmnet.V, velocity_at_t_mid - true_velocity_at_t_mid)
+    
+    loss = loss + disc_err.norm(p=2,dim=[1,2,3]).pow(2).mean()
+    return loss
+
+
+def ANILoss_gh_energy_plus_discretization_todo4(interval_K, edmnet, images, labels, g_fn, h_fn, T, tmin=1e-9, disc_mult=1.0):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns per-pixel squared error tensor (identical convention as EDMLoss)
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g, dot_g = g_fn.g_and_grad(t_vec)
+    h, dot_h = h_fn.g_and_grad(t_vec)
+
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)        #eps ~ N(0,I)
+    x_noisy = images + mat_mul((g,h), edmnet.V, eps, power=0.5, identity_scaling=0.0)
+    
+    #####################
+    ### compute detached score
+    #####################
+    detached = {k: v.detach() for k,v in edmnet.named_parameters()}
+    M_times_score_detached = functional_call(edmnet, detached, (x_noisy, (g, h)),
+                         {"class_labels": labels}) - x_noisy
+    
+    #####################
+    ### dotgsqogsqogp1: loss wrt true score  (3.1 FID)
+    #####################
+    loss = 0
+
+    #####################
+    ### loss wrt discretization
+    #####################
+    interval = 6400.0/interval_K
+    delta = (torch.rand(t_vec.shape,device=device)) * interval
+    #delta = (torch.rand(t_vec.shape,device=device)*0.5+0.5) * interval
+    t_vec_target = torch.clamp(t_vec - delta, min=1e-9, max=6400)
+
+    t_vec_next = t_vec + 0.5 * (t_vec_target - t_vec)
+    
+    g_next, _ = g_fn.g_and_grad(t_vec_next)
+    h_next, _ = h_fn.g_and_grad(t_vec_next)
+
+    t_rand_mid = t_vec + torch.rand(t_vec.shape,device=device) * (t_vec_target - t_vec) 
+    g_rand_mid, dotg_rand_mid = g_fn.g_and_grad(t_rand_mid)
+    h_rand_mid, doth_rand_mid = h_fn.g_and_grad(t_rand_mid)
+    
+    #g_next = (g.sqrt()-(dot_g/g.sqrt() *delta))**2
+    #h_next = (h.sqrt()-(dot_h/h.sqrt() *delta))**2
+    
+    # compute update direction
+    flow_dir = mat_mul((g, h), edmnet.V, M_times_score_detached, power = -0.5)
+    x_next = x_noisy + mat_mul((g_next.sqrt() - g.sqrt(), h_next.sqrt() - h.sqrt()), 
+                      edmnet.V, -flow_dir, power = 1.0)
+    M_times_score_next_detached = functional_call(edmnet, detached, (x_next, (g_next, h_next)),
+                         {"class_labels": labels}) - x_next
+    flow_dir_next = mat_mul((g_next, h_next), edmnet.V, M_times_score_next_detached, power = -0.5)
+
+    # estimate d/ds flow
+    # wrong: dt_flow_dir = mat_mul((1/(g_next.sqrt()-g.sqrt()),1/(h_next.sqrt()-h.sqrt())), edmnet.V, 0.5 * (flow_dir_next - flow_dir)) 
+    # michael todo 1: check if code works better after bugfix below:
+    dt_flow_dir = mat_mul((1/(g_next.sqrt()-g.sqrt()),1/(h_next.sqrt()-h.sqrt())), edmnet.V, (flow_dir_next - flow_dir)) 
+
+    #disc_err = mat_mul(((dot_g)/(g**0.5)/((g+1)**0.5),(dot_h)/(h**0.5)/((h+1)**0.5)), edmnet.V, (flow_dir - flow_dir_next)) 
+
+    displacement_at_t_mid = (mat_mul((g_rand_mid.sqrt()-g.sqrt(),h_rand_mid.sqrt()-h.sqrt()), edmnet.V, - flow_dir) 
+                     + mat_mul(((g_rand_mid.sqrt()-g.sqrt())**2,(h_rand_mid.sqrt()-h.sqrt())**2), edmnet.V, - 0.5 * dt_flow_dir))
+    x_rand_mid = x_noisy + displacement_at_t_mid
+    
+    velocity_at_t_mid = mat_mul((dotg_rand_mid/(g_rand_mid**0.5),doth_rand_mid/(h_rand_mid**0.5)), edmnet.V, 
+                     - flow_dir + mat_mul(((g_rand_mid.sqrt()-g.sqrt()),(h_rand_mid.sqrt()-h.sqrt())), edmnet.V, - dt_flow_dir))
+
+    M_times_score_rand_mid = functional_call(edmnet, detached, (x_rand_mid, (g_rand_mid, h_rand_mid)),
+                         {"class_labels": labels}) - x_rand_mid
+    
+    true_velocity_at_t_mid = mat_mul((dotg_rand_mid/g_rand_mid,doth_rand_mid/h_rand_mid), edmnet.V, - M_times_score_rand_mid) 
+
+    disc_err = mat_mul((1/(g_rand_mid+0.5)**0.5,1/(h_rand_mid+0.5)**0.5), edmnet.V, velocity_at_t_mid - true_velocity_at_t_mid)
+    
+    loss = loss + disc_err.norm(p=2,dim=[1,2,3]).pow(2).mean()
+    return loss
+    
+def ANILoss_gh_energy_plus_discretization_backprop(edmnet, images, labels, g_fn, h_fn, T, tmin=1e-9, disc_mult=1.0):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns per-pixel squared error tensor (identical convention as EDMLoss)
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g, dot_g = g_fn.g_and_grad(t_vec)
+    h, dot_h = h_fn.g_and_grad(t_vec)
+
+    labels = labels.detach()
+    eps = torch.randn_like(images)        #eps ~ N(0,I)
+    x_noisy = images + mat_mul((g,h), edmnet.V, eps, power=0.5, identity_scaling=0.0)
+    
+
+    #####################
+    ### loss wrt discretization
+    #####################
+    interval = 6400.0/8
+    delta = (torch.rand(t_vec.shape,device=device)) * interval
+    #delta = (torch.rand(t_vec.shape,device=device)*0.5+0.5) * interval
+    t_vec_target = torch.clamp(t_vec - delta, min=1e-9, max=6400)
+
+    t_vec_next = t_vec + 0.5 * (t_vec_target - t_vec)
+
+    g_next, _ = g_fn.g_and_grad(t_vec_next)
+    h_next, _ = h_fn.g_and_grad(t_vec_next)
+
+    t_rand_mid = t_vec + torch.rand(t_vec.shape,device=device) * (t_vec_target - t_vec) 
+    g_rand_mid, dotg_rand_mid = g_fn.g_and_grad(t_rand_mid)
+    h_rand_mid, doth_rand_mid = h_fn.g_and_grad(t_rand_mid)
+    
+    #g_next = (g.sqrt()-(dot_g/g.sqrt() *delta))**2
+    #h_next = (h.sqrt()-(dot_h/h.sqrt() *delta))**2
+    
+    # compute update direction
+    M_times_score = edmnet(x_noisy, (g,h), class_labels=labels) - x_noisy
+    flow_dir = mat_mul((g, h), edmnet.V, M_times_score, power = -0.5)
+    x_next = x_noisy + mat_mul((g_next.sqrt() - g.sqrt(), h_next.sqrt() - h.sqrt()), 
+                      edmnet.V, -flow_dir, power = 1.0)
+    M_times_score_next_detached = edmnet(x_next, (g_next, h_next), class_labels=labels) - x_next
+    
+    flow_dir_next = mat_mul((g_next, h_next), edmnet.V, M_times_score_next_detached, power = -0.5)
+
+    # estimate d/ds flow
+    dt_flow_dir = mat_mul((1/(g_next.sqrt()-g.sqrt()),1/(h_next.sqrt()-h.sqrt())), edmnet.V, 0.5 * (flow_dir_next - flow_dir)) 
+
+    #disc_err = mat_mul(((dot_g)/(g**0.5)/((g+1)**0.5),(dot_h)/(h**0.5)/((h+1)**0.5)), edmnet.V, (flow_dir - flow_dir_next)) 
+
+    displacement_at_t_mid = (mat_mul((g_rand_mid.sqrt()-g.sqrt(),h_rand_mid.sqrt()-h.sqrt()), edmnet.V, - flow_dir) 
+                     + mat_mul(((g_rand_mid.sqrt()-g.sqrt())**2,(h_rand_mid.sqrt()-h.sqrt())**2), edmnet.V, - 0.5 * dt_flow_dir))
+    x_rand_mid = x_noisy + displacement_at_t_mid
+    
+    velocity_at_t_mid = mat_mul((dotg_rand_mid/(g_rand_mid**0.5),doth_rand_mid/(h_rand_mid**0.5)), edmnet.V, 
+                     - flow_dir + mat_mul(((g_rand_mid.sqrt()-g.sqrt()),(h_rand_mid.sqrt()-h.sqrt())), edmnet.V, - dt_flow_dir))
+
+    #this one maybe should detach
+    M_times_score_rand_mid = edmnet(x_rand_mid, (g_rand_mid, h_rand_mid), class_labels=labels) - x_rand_mid
+    
+    true_velocity_at_t_mid = mat_mul((dotg_rand_mid/g_rand_mid,doth_rand_mid/h_rand_mid), edmnet.V, - M_times_score_rand_mid) 
+
+    disc_err = mat_mul((1/(g_rand_mid+0.5)**0.5,1/(h_rand_mid+0.5)**0.5), edmnet.V, velocity_at_t_mid - true_velocity_at_t_mid)
+    
+    loss = disc_err.norm(p=2,dim=[1,2,3]).pow(2).mean()
+    return loss
+
+def ANILoss_gh_energy_plus_discretization_backprop_v2(edmnet, edmnet_frz, images, labels, g_fn, h_fn, T, tmin=1e-9, disc_mult=1.0):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns per-pixel squared error tensor (identical convention as EDMLoss)
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g, dot_g = g_fn.g_and_grad(t_vec)
+    h, dot_h = h_fn.g_and_grad(t_vec)
+
+    labels = labels.detach()
+    eps = torch.randn_like(images)        #eps ~ N(0,I)
+    x_noisy = images + mat_mul((g,h), edmnet.V, eps, power=0.5, identity_scaling=0.0)
+    
+
+    #####################
+    ### loss wrt discretization
+    #####################
+    interval = 6400.0/8
+    delta = (torch.rand(t_vec.shape,device=device)) * interval
+    #delta = (torch.rand(t_vec.shape,device=device)*0.5+0.5) * interval
+    t_vec_target = torch.clamp(t_vec - delta, min=1e-9, max=6400)
+
+    t_vec_next = t_vec + 0.5 * (t_vec_target - t_vec)
+
+    g_next, _ = g_fn.g_and_grad(t_vec_next)
+    h_next, _ = h_fn.g_and_grad(t_vec_next)
+
+    t_rand_mid = t_vec + torch.rand(t_vec.shape,device=device) * (t_vec_target - t_vec) 
+    g_rand_mid, dotg_rand_mid = g_fn.g_and_grad(t_rand_mid)
+    h_rand_mid, doth_rand_mid = h_fn.g_and_grad(t_rand_mid)
+    
+    #g_next = (g.sqrt()-(dot_g/g.sqrt() *delta))**2
+    #h_next = (h.sqrt()-(dot_h/h.sqrt() *delta))**2
+    
+    # compute update direction
+    M_times_score = edmnet(x_noisy, (g,h), class_labels=labels) - x_noisy
+    flow_dir = mat_mul((g, h), edmnet.V, M_times_score, power = -0.5)
+    x_next = x_noisy + mat_mul((g_next.sqrt() - g.sqrt(), h_next.sqrt() - h.sqrt()), 
+                      edmnet.V, -flow_dir, power = 1.0)
+    M_times_score_next_detached = edmnet(x_next, (g_next, h_next), class_labels=labels) - x_next
+    
+    flow_dir_next = mat_mul((g_next, h_next), edmnet.V, M_times_score_next_detached, power = -0.5)
+
+    # estimate d/ds flow
+    dt_flow_dir = mat_mul((1/(g_next.sqrt()-g.sqrt()),1/(h_next.sqrt()-h.sqrt())), edmnet.V, 0.5 * (flow_dir_next - flow_dir)) 
+
+    #disc_err = mat_mul(((dot_g)/(g**0.5)/((g+1)**0.5),(dot_h)/(h**0.5)/((h+1)**0.5)), edmnet.V, (flow_dir - flow_dir_next)) 
+
+    displacement_at_t_mid = (mat_mul((g_rand_mid.sqrt()-g.sqrt(),h_rand_mid.sqrt()-h.sqrt()), edmnet.V, - flow_dir) 
+                     + mat_mul(((g_rand_mid.sqrt()-g.sqrt())**2,(h_rand_mid.sqrt()-h.sqrt())**2), edmnet.V, - 0.5 * dt_flow_dir))
+    x_rand_mid = x_noisy + displacement_at_t_mid
+    
+    velocity_at_t_mid = mat_mul((dotg_rand_mid/(g_rand_mid**0.5),doth_rand_mid/(h_rand_mid**0.5)), edmnet.V, 
+                     - flow_dir + mat_mul(((g_rand_mid.sqrt()-g.sqrt()),(h_rand_mid.sqrt()-h.sqrt())), edmnet.V, - dt_flow_dir))
+
+    #this one maybe should detach
+    M_times_score_rand_mid = edmnet_frz(x_rand_mid, (g_rand_mid, h_rand_mid), class_labels=labels) - x_rand_mid
+    
+    true_velocity_at_t_mid = mat_mul((dotg_rand_mid/g_rand_mid,doth_rand_mid/h_rand_mid), edmnet_frz.V, - M_times_score_rand_mid) 
+
+    disc_err = mat_mul((1/(g_rand_mid+0.5)**0.5,1/(h_rand_mid+0.5)**0.5), edmnet.V, velocity_at_t_mid - true_velocity_at_t_mid)
+    
+    loss = disc_err.norm(p=2,dim=[1,2,3]).pow(2).mean()
+    return loss
+
+def ANILoss_gh_energy_plus_discretization_backprop_v3(edmnet, edmnet_frz, images, labels, g_fn, h_fn, T, tmin=1e-9, disc_mult=1.0):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns per-pixel squared error tensor (identical convention as EDMLoss)
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g, dot_g = g_fn.g_and_grad(t_vec)
+    h, dot_h = h_fn.g_and_grad(t_vec)
+
+    labels = labels.detach()
+    eps = torch.randn_like(images)        #eps ~ N(0,I)
+    x_noisy = images + mat_mul((g,h), edmnet.V, eps, power=0.5, identity_scaling=0.0)
+    
+
+    #####################
+    ### loss wrt discretization
+    #####################
+    interval = 6400.0/8
+    delta = (torch.rand(t_vec.shape,device=device)) * interval
+    #delta = (torch.rand(t_vec.shape,device=device)*0.5+0.5) * interval
+    t_vec_target = torch.clamp(t_vec - delta, min=1e-9, max=6400)
+
+    t_vec_next = t_vec + 0.5 * (t_vec_target - t_vec)
+
+    g_next, _ = g_fn.g_and_grad(t_vec_next)
+    h_next, _ = h_fn.g_and_grad(t_vec_next)
+
+    t_rand_mid = t_vec + torch.rand(t_vec.shape,device=device) * (t_vec_target - t_vec) 
+    g_rand_mid, dotg_rand_mid = g_fn.g_and_grad(t_rand_mid)
+    h_rand_mid, doth_rand_mid = h_fn.g_and_grad(t_rand_mid)
+    
+    #g_next = (g.sqrt()-(dot_g/g.sqrt() *delta))**2
+    #h_next = (h.sqrt()-(dot_h/h.sqrt() *delta))**2
+    
+    # compute update direction
+    M_times_score = edmnet(x_noisy, (g,h), class_labels=labels) - x_noisy
+    flow_dir = mat_mul((g, h), edmnet.V, M_times_score, power = -0.5)
+    x_next = x_noisy + mat_mul((g_next.sqrt() - g.sqrt(), h_next.sqrt() - h.sqrt()), 
+                      edmnet.V, -flow_dir, power = 1.0)
+    M_times_score_next_detached = edmnet(x_next, (g_next, h_next), class_labels=labels) - x_next
+    
+    flow_dir_next = mat_mul((g_next, h_next), edmnet.V, M_times_score_next_detached, power = -0.5)
+
+    # estimate d/ds flow
+    dt_flow_dir = mat_mul((1/(g_next.sqrt()-g.sqrt()),1/(h_next.sqrt()-h.sqrt())), edmnet.V, 0.5 * (flow_dir_next - flow_dir)) 
+
+    #disc_err = mat_mul(((dot_g)/(g**0.5)/((g+1)**0.5),(dot_h)/(h**0.5)/((h+1)**0.5)), edmnet.V, (flow_dir - flow_dir_next)) 
+
+    displacement_at_t_mid = (mat_mul((g_rand_mid.sqrt()-g.sqrt(),h_rand_mid.sqrt()-h.sqrt()), edmnet.V, - flow_dir) 
+                     + mat_mul(((g_rand_mid.sqrt()-g.sqrt())**2,(h_rand_mid.sqrt()-h.sqrt())**2), edmnet.V, - 0.5 * dt_flow_dir))
+    x_rand_mid = x_noisy + displacement_at_t_mid
+
+    velocity_at_t_mid = mat_mul((dotg_rand_mid/(g_rand_mid**0.5),doth_rand_mid/(h_rand_mid**0.5)), edmnet.V, 
+                     - flow_dir + mat_mul(((g_rand_mid.sqrt()-g.sqrt()),(h_rand_mid.sqrt()-h.sqrt())), edmnet.V, - dt_flow_dir))
+                     
+    with torch.no_grad():
+        M_times_score_frz = edmnet_frz(x_noisy, (g,h), class_labels=labels) - x_noisy
+        flow_dir_frz = mat_mul((g, h), edmnet_frz.V, M_times_score_frz, power = -0.5)
+        x_next_frz = x_noisy + mat_mul((g_next.sqrt() - g.sqrt(), h_next.sqrt() - h.sqrt()), edmnet_frz.V, -flow_dir_frz, power = 1.0)
+        M_times_score_next_detached_frz = edmnet_frz(x_next_frz, (g_next,h_next), class_labels=labels) - x_next_frz
+        flow_dir_next_frz = mat_mul((g_next, h_next), edmnet_frz.V, M_times_score_next_detached_frz, power = -0.5)
+        dt_flow_dir_frz = mat_mul((1/(g_next.sqrt()-g.sqrt()),1/(h_next.sqrt()-h.sqrt())), edmnet_frz.V, 0.5 * (flow_dir_next_frz - flow_dir_frz)) 
+        displacement_at_t_mid_frz = (mat_mul((g_rand_mid.sqrt()-g.sqrt(),h_rand_mid.sqrt()-h.sqrt()), edmnet_frz.V, - flow_dir_frz) 
+                        + mat_mul(((g_rand_mid.sqrt()-g.sqrt())**2,(h_rand_mid.sqrt()-h.sqrt())**2), edmnet_frz.V, - 0.5 * dt_flow_dir_frz))
+        x_rand_mid_frz = x_noisy + displacement_at_t_mid_frz
+        #this one maybe should detach
+        M_times_score_rand_mid = edmnet_frz(x_rand_mid_frz, (g_rand_mid, h_rand_mid), class_labels=labels) - x_rand_mid_frz
+        
+        true_velocity_at_t_mid = mat_mul((dotg_rand_mid/g_rand_mid,doth_rand_mid/h_rand_mid), edmnet_frz.V, - M_times_score_rand_mid) 
+
+    disc_err = mat_mul((1/(g_rand_mid+0.5)**0.5,1/(h_rand_mid+0.5)**0.5), edmnet.V, velocity_at_t_mid - true_velocity_at_t_mid)
+    
+    loss = disc_err.norm(p=2,dim=[1,2,3]).pow(2).mean()
+    return loss
+
+def ANILoss_gh_energy_plus_discretization_two_wrapper(edmnet, images, labels, g_fn, h_fn, g_fn_2, h_fn_2, T, tmin=1e-9, disc_mult=1.0):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns per-pixel squared error tensor (identical convention as EDMLoss)
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g, dot_g = g_fn.g_and_grad(t_vec)
+    h, dot_h = h_fn.g_and_grad(t_vec)
+
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)        #eps ~ N(0,I)
+    x_noisy = images + mat_mul((g,h), edmnet.V, eps, power=0.5, identity_scaling=0.0)
+    
+    #####################
+    ### compute detached score
+    #####################
+    detached = {k: v.detach() for k,v in edmnet.named_parameters()}
+    M_times_score_detached = functional_call(edmnet, detached, (x_noisy, (g, h)),
+                         {"class_labels": labels}) - x_noisy
+    
+    #####################
+    ### dotgsqogsqogp1: loss wrt true score  (3.1 FID)
+    #####################
+    scaled_net_score = mat_mul((dot_g/(g)/((g+0.5)**0.5),dot_h/(h)/((h+0.5)**0.5)), edmnet.V, M_times_score_detached) 
+    scaled_true_noisy_score = mat_mul((dot_g/(g)/((g+0.5)**0.5),dot_h/(h)/((h+0.5)**0.5)), edmnet.V, images-x_noisy) 
+
+    loss = (scaled_true_noisy_score - scaled_net_score).pow(2).sum(dim=[1,2,3]).mean() 
+
+    loss = loss - (scaled_true_noisy_score).pow(2).sum(dim=[1,2,3]).mean() + (scaled_net_score).pow(2).sum(dim=[1,2,3]).mean()
+
+    loss = loss
+
+    #####################
+    ### loss wrt discretization
+    #####################
+    interval = 6400.0/8
+    delta = (torch.rand(t_vec.shape,device=device)) * interval
+    #delta = (torch.rand(t_vec.shape,device=device)*0.5+0.5) * interval
+    t_vec_target = torch.clamp(t_vec - delta, min=1e-9, max=6400)
+
+    t_vec_next = t_vec + 0.5 * (t_vec_target - t_vec)
+    
+    g_next, _ = g_fn.g_and_grad(t_vec_next)
+    h_next, _ = h_fn.g_and_grad(t_vec_next)
+
+    t_rand_mid = t_vec + torch.rand(t_vec.shape,device=device) * (t_vec_target - t_vec) 
+    g_rand_mid, dotg_rand_mid = g_fn_2.g_and_grad(t_rand_mid)
+    h_rand_mid, doth_rand_mid = h_fn_2.g_and_grad(t_rand_mid)
+    
+    #g_next = (g.sqrt()-(dot_g/g.sqrt() *delta))**2
+    #h_next = (h.sqrt()-(dot_h/h.sqrt() *delta))**2
+    
+    # compute update direction
+    flow_dir = mat_mul((g, h), edmnet.V, M_times_score_detached, power = -0.5)
+    x_next = x_noisy + mat_mul((g_next.sqrt() - g.sqrt(), h_next.sqrt() - h.sqrt()), 
+                      edmnet.V, -flow_dir, power = 1.0)
+    M_times_score_next_detached = functional_call(edmnet, detached, (x_next, (g_next, h_next)),
+                         {"class_labels": labels}) - x_next
+    flow_dir_next = mat_mul((g_next, h_next), edmnet.V, M_times_score_next_detached, power = -0.5)
+
+    # estimate d/ds flow
+    dt_flow_dir = mat_mul((1/(g_next.sqrt()-g.sqrt()),1/(h_next.sqrt()-h.sqrt())), edmnet.V, 0.5 * (flow_dir_next - flow_dir)) 
+
+    #disc_err = mat_mul(((dot_g)/(g**0.5)/((g+1)**0.5),(dot_h)/(h**0.5)/((h+1)**0.5)), edmnet.V, (flow_dir - flow_dir_next)) 
+
+    displacement_at_t_mid = (mat_mul((g_rand_mid.sqrt()-g.sqrt(),h_rand_mid.sqrt()-h.sqrt()), edmnet.V, - flow_dir) 
+                     + mat_mul(((g_rand_mid.sqrt()-g.sqrt())**2,(h_rand_mid.sqrt()-h.sqrt())**2), edmnet.V, - 0.5 * dt_flow_dir))
+    x_rand_mid = x_noisy + displacement_at_t_mid
+    
+    velocity_at_t_mid = mat_mul((dotg_rand_mid/(g_rand_mid**0.5),doth_rand_mid/(h_rand_mid**0.5)), edmnet.V, 
+                     - flow_dir + mat_mul(((g_rand_mid.sqrt()-g.sqrt()),(h_rand_mid.sqrt()-h.sqrt())), edmnet.V, - dt_flow_dir))
+
+    M_times_score_rand_mid = functional_call(edmnet, detached, (x_rand_mid, (g_rand_mid, h_rand_mid)),
+                         {"class_labels": labels}) - x_rand_mid
+    
+    true_velocity_at_t_mid = mat_mul((dotg_rand_mid/g_rand_mid,doth_rand_mid/h_rand_mid), edmnet.V, - M_times_score_rand_mid) 
+
+    disc_err = mat_mul((1/(g_rand_mid+0.5)**0.5,1/(h_rand_mid+0.5)**0.5), edmnet.V, velocity_at_t_mid - true_velocity_at_t_mid)
+    
+    loss = loss + disc_err.norm(p=2,dim=[1,2,3]).pow(2).mean()
+    return loss
+
+# ============================================================
+# Simple scalar wrapper schedule (piecewise linear monotone)
+# ============================================================
+def linear_interp(x, xp, fp):
+    """
+    Safe interpolation compatible with all PyTorch versions.
+    x:  [...], query points
+    xp: [N], sorted knot locations
+    fp: [N], function values
+    """
+    x = x.unsqueeze(-1)  # [...,1]
+
+    inds = torch.searchsorted(xp, x)   # [...,1], index of right bin
+    inds = torch.clamp(inds, 1, xp.numel()-1)
+
+    x0 = xp[inds-1]   # [...,1]
+    x1 = xp[inds]     # [...,1]
+    y0 = fp[inds-1]   # [...,1]
+    y1 = fp[inds]     # [...,1]
+
+    w = (x - x0) / (x1 - x0 + 1e-12)
+    return y0 + w * (y1 - y0)
+
+
+def ANILoss_gh_energy_variance_reduce(edmnet, images, labels, g_fn, h_fn, T, tmin=1e-9, disc_mult=1.0):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns per-pixel squared error tensor (identical convention as EDMLoss)
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g, dot_g = g_fn.g_and_grad(t_vec)
+    h, dot_h = h_fn.g_and_grad(t_vec)
+
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)        #eps ~ N(0,I)
+    x_noisy = images + mat_mul((g,h), edmnet.V, eps, power=0.5, identity_scaling=0.0)
+    
+    #####################
+    ### compute detached score
+    #####################
+    detached = {k: v.detach() for k,v in edmnet.named_parameters()}
+    M_times_score_detached = functional_call(edmnet, detached, (x_noisy, (g, h)),
+                         {"class_labels": labels}) - x_noisy
+    
+    #####################
+    ### dotgsqogsqogp1: loss wrt true score  (3.1 FID)
+    #####################
+    scaled_net_score = mat_mul((dot_g/(g)/((g+0.5)**0.5),dot_h/(h)/((h+0.5)**0.5)), edmnet.V, M_times_score_detached) 
+    scaled_true_noisy_score = mat_mul((dot_g/(g)/((g+0.5)**0.5),dot_h/(h)/((h+0.5)**0.5)), edmnet.V, images-x_noisy) 
+
+    loss = (scaled_true_noisy_score - scaled_net_score).pow(2).sum(dim=[1,2,3]).mean() 
+
+    loss = loss - (scaled_true_noisy_score).pow(2).sum(dim=[1,2,3]).mean() + (scaled_net_score).pow(2).sum(dim=[1,2,3]).mean()
+
+    loss = loss
+
+    return loss
 
 #######################################################################
 #######  Code for optimizing score_and_energy_loss over gh   ##########
@@ -501,6 +2303,8 @@ class ANI_absM_Precond_Flow_Net(torch.nn.Module):
                  if self.use_fp16 and not force_fp32 and x.is_cuda
                  else torch.float32)
         
+        # if class_labels is not None:
+        #     class_labels = class_labels.to(torch.float32).reshape(-1, self.label_dim)
         if class_labels is not None:
             class_labels = class_labels.to(torch.float32).reshape(-1, self.label_dim)
 
@@ -527,8 +2331,179 @@ class ANI_absM_Precond_Flow_Net(torch.nn.Module):
         
     def round_sigma(self, sigma):
         return torch.as_tensor(sigma)
-    
-def flow_matching_energy(flownet, images, labels, g_fn, h_fn, dataset, T, tmin=1e-9):
+
+class ANI_absM_Precond_Flow_Net_basis(torch.nn.Module):
+    def __init__(self, edm_precond):
+        super().__init__()
+        # --------- reuse core parameters ---------------------------------
+        self.img_resolution = edm_precond.img_resolution
+        self.img_channels   = edm_precond.img_channels
+        self.label_dim      = edm_precond.label_dim
+        self.use_fp16       = edm_precond.use_fp16
+        self.sigma_min      = edm_precond.sigma_min
+        self.sigma_max      = edm_precond.sigma_max
+        self.sigma_data     = edm_precond.sigma_data
+        # --------- copy the trained UNet ---------------------------------
+        self.model = edm_precond.model   # keep weights
+
+    # ------------------------------------------------------------------
+    # forward : returns flow(x)
+    # ------------------------------------------------------------------
+    def forward(
+        self,
+        x,                              # [B,C,W,W]  noisy x_t
+        gh,                             # (g,h) with shape [B]
+        V,                              # [K,W,W]  <<<<<< NEW
+        class_labels=None,
+        force_fp32=False,
+        **model_kwargs,
+    ):
+        x = x.to(torch.float32)
+        g_t, h_t = gh
+
+        sigma_g_t = g_t.sqrt()
+        sigma_h_t = h_t.sqrt()
+        c_noise = (sigma_g_t.log() + sigma_h_t.log()) / 8
+
+        dtype = (
+            torch.float16
+            if self.use_fp16 and not force_fp32 and x.is_cuda
+            else torch.float32
+        )
+
+        if class_labels is not None:
+            class_labels = class_labels.to(torch.float32).reshape(-1, self.label_dim)
+
+        # -------- anisotropic preconditioning (PCA / DCT both OK) --------
+        z_t = mat_mul(
+            (1/(g_t+self.sigma_data**2).sqrt(),
+             1/(h_t+self.sigma_data**2).sqrt()),
+            V, x, power=1.0, identity_scaling=0.0
+        )
+
+        F_x = self.model(
+            z_t.to(dtype),
+            c_noise.flatten(),
+            class_labels=class_labels,
+            **model_kwargs,
+        ).to(torch.float32)
+
+        c_out_g = g_t.sqrt() * self.sigma_data / (g_t + self.sigma_data**2).sqrt()
+        c_out_h = h_t.sqrt() * self.sigma_data / (h_t + self.sigma_data**2).sqrt()
+
+        c_out_F_x = mat_mul(
+            (c_out_g, c_out_h),
+            V, F_x, power=1.0, identity_scaling=0.0
+        )
+
+        c_skip_g = self.sigma_data**2 / (g_t + self.sigma_data**2)
+        c_skip_h = self.sigma_data**2 / (h_t + self.sigma_data**2)
+
+        c_skip_x = mat_mul(
+            (c_skip_g, c_skip_h),
+            V, x, power=1.0, identity_scaling=0.0
+        )
+
+        D_x = c_skip_x + c_out_F_x
+
+        flow_x = mat_mul(
+            (g_t, h_t),
+            V, D_x - x, power=-0.5, identity_scaling=0.0
+        )
+
+        return flow_x
+
+    def round_sigma(self, sigma):
+        return torch.as_tensor(sigma)
+
+class ANI_absM_Precond_Flow_Net_basis_v3(torch.nn.Module):
+    def __init__(self, edm_precond):
+        super().__init__()
+        # --------- reuse core parameters ---------------------------------
+        self.img_resolution = edm_precond.img_resolution
+        self.img_channels   = edm_precond.img_channels
+        self.label_dim      = edm_precond.label_dim
+        self.use_fp16       = edm_precond.use_fp16
+        self.sigma_min      = edm_precond.sigma_min
+        self.sigma_max      = edm_precond.sigma_max
+        self.sigma_data     = edm_precond.sigma_data
+        # --------- copy the trained UNet ---------------------------------
+        self.model = edm_precond.model   # keep weights
+
+    # ------------------------------------------------------------------
+    # forward : returns flow(x)
+    # ------------------------------------------------------------------
+    def forward(
+        self,
+        x,                              # [B,C,W,W]  noisy x_t
+        gh,                             # (g,h) with shape [B]
+        V,
+        labels_id=None,                 # [K,W,W]  <<<<<< NEW
+        class_labels=None,
+        force_fp32=False,
+        **model_kwargs,
+    ):
+        x = x.to(torch.float32)
+        g_t, h_t = gh
+
+        sigma_g_t = g_t.sqrt()
+        sigma_h_t = h_t.sqrt()
+        c_noise = (sigma_g_t.log() + sigma_h_t.log()) / 8
+
+        dtype = (
+            torch.float16
+            if self.use_fp16 and not force_fp32 and x.is_cuda
+            else torch.float32
+        )
+
+        # labels_id = None
+        # if class_labels is not None:
+        #     class_labels = class_labels.to(torch.float32).reshape(-1, self.label_dim)
+        #     labels_id = class_labels.argmax(dim=1)
+
+        # -------- anisotropic preconditioning (PCA / DCT both OK) --------
+        z_t = mat_mul_labelwise(
+            (1/(g_t+self.sigma_data**2).sqrt(),
+             1/(h_t+self.sigma_data**2).sqrt()),
+            V, x, labels=labels_id, power=1.0, identity_scaling=0.0
+        )
+
+        F_x = self.model(
+            z_t.to(dtype),
+            c_noise.flatten(),
+            class_labels=class_labels,
+            **model_kwargs,
+        ).to(torch.float32)
+
+        c_out_g = g_t.sqrt() * self.sigma_data / (g_t + self.sigma_data**2).sqrt()
+        c_out_h = h_t.sqrt() * self.sigma_data / (h_t + self.sigma_data**2).sqrt()
+
+        c_out_F_x = mat_mul_labelwise(
+            (c_out_g, c_out_h),
+            V, F_x, labels=labels_id, power=1.0, identity_scaling=0.0
+        )
+
+        c_skip_g = self.sigma_data**2 / (g_t + self.sigma_data**2)
+        c_skip_h = self.sigma_data**2 / (h_t + self.sigma_data**2)
+
+        c_skip_x = mat_mul_labelwise(
+            (c_skip_g, c_skip_h),
+            V, x, labels=labels_id, power=1.0, identity_scaling=0.0
+        )
+
+        D_x = c_skip_x + c_out_F_x
+
+        flow_x = mat_mul_labelwise(
+            (g_t, h_t),
+            V, D_x - x, labels=labels_id, power=-0.5, identity_scaling=0.0
+        )
+
+        return flow_x
+
+    def round_sigma(self, sigma):
+        return torch.as_tensor(sigma)
+
+def flow_matching_energy(flownet, images, labels, g_fn, h_fn, T, tmin=1e-9):
     """
     images : [B,C,W,W]  in [-1,1]
     returns scalar mean loss
@@ -539,8 +2514,49 @@ def flow_matching_energy(flownet, images, labels, g_fn, h_fn, dataset, T, tmin=1
     g_t, dotg_t = g_fn.g_and_grad(t_vec)
     h_t, doth_t = h_fn.g_and_grad(t_vec)
 
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)        
+    x_noisy = images + mat_mul((g_t,h_t), flownet.V, eps, power=0.5, identity_scaling=0.0)
+    flow_at_x = flownet(x_noisy, (g_t.detach(),h_t.detach()), class_labels=labels)
+
+    target_flow = mat_mul((1/(g_t**0.5),1/(h_t**0.5)), flownet.V, images - x_noisy, power=1.0, identity_scaling=0.0) 
+
+    # following loss does not back-prop through flownet to get time.
+    flow_error_vec = mat_mul(((dotg_t)/(g_t**0.5)/(g_t+1)**0.5,(doth_t)/(h_t**0.5)/(h_t+1)**0.5), flownet.V, flow_at_x - target_flow, power=1.0, identity_scaling=0.0) 
+    loss = flow_error_vec.pow(2).sum(dim=[1,2,3]).sum()
+    
+    # now, manually compute del_theta flow(x;theta):
+    #del_theta_flow = estimate_flow_derivative_gh(flownet, x_noisy, (g_t, h_t), (dotg_t, doth_t), labels, flow_at_x.detach())
+    del_flow_loss = 2 * mat_mul(((dotg_t**2)/(g_t)/(g_t+1),(doth_t**2)/(h_t)/(h_t+1)), flownet.V, flow_at_x - target_flow, power=1.0, identity_scaling=0.0).detach()
+    
+    additional_loss = create_flow_derivative_gh_term(flownet, x_noisy, (g_t, h_t), (dotg_t, doth_t), labels, flow_at_x, del_flow_loss)
+
+    # additional loss term
+    #additional_loss = torch.einsum('BCHW,BCHW->B',(del_flow_loss, del_theta_flow)).sum()
+    assert additional_loss.item()==0
+
+    loss = loss + additional_loss
+
+    return loss
+
+def flow_matching_energy_debug(flownet, images, labels, g_fn, h_fn, dataset, T, tmin=1e-9):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns scalar mean loss
+    """
+    if isinstance(flownet, torch.nn.parallel.DistributedDataParallel):
+        flownet = flownet.module
+    B, _, _, _ = images.shape
+    device = images.device
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g_t, dotg_t = g_fn.g_and_grad(t_vec)
+    h_t, doth_t = h_fn.g_and_grad(t_vec)
+
     if dataset == 'cifar10':
         c = 0.5
+    elif dataset == 'afhqv2':
+        c = 2
     else:
         c = 1
     if labels is not None:
@@ -559,7 +2575,7 @@ def flow_matching_energy(flownet, images, labels, g_fn, h_fn, dataset, T, tmin=1
     #del_theta_flow = estimate_flow_derivative_gh(flownet, x_noisy, (g_t, h_t), (dotg_t, doth_t), labels, flow_at_x.detach())
     del_flow_loss = 2 * mat_mul(((dotg_t**2)/(g_t)/(g_t+c),(doth_t**2)/(h_t)/(h_t+c)), flownet.V, flow_at_x - target_flow, power=1.0, identity_scaling=0.0).detach()
     
-    additional_loss = create_flow_derivative_gh_term(flownet, x_noisy, (g_t, h_t), (dotg_t, doth_t), labels, flow_at_x, del_flow_loss)
+    additional_loss = create_flow_derivative_gh_term_debug(flownet, x_noisy, (g_t, h_t), (dotg_t, doth_t), labels, flow_at_x, del_flow_loss)
 
     # additional loss term
     #additional_loss = torch.einsum('BCHW,BCHW->B',(del_flow_loss, del_theta_flow)).sum()
@@ -569,7 +2585,874 @@ def flow_matching_energy(flownet, images, labels, g_fn, h_fn, dataset, T, tmin=1
 
     return loss
 
+def flow_matching_energy_debug_condition(flownet, images, labels, g_fn, h_fn, dataset, T, tmin=1e-9, class_ids=None):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns scalar mean loss
+    """
+    if isinstance(flownet, torch.nn.parallel.DistributedDataParallel):
+        flownet = flownet.module
+    B, _, _, _ = images.shape
+    device = images.device
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
 
+    is_dict = isinstance(g_fn, (dict, torch.nn.ModuleDict))
+    if is_dict:
+        assert class_ids is not None, "When g_fn is dict/ModuleDict, please pass class_ids (LongTensor [B])."
+        # allocate
+        g_t    = torch.empty(B, device=device, dtype=torch.float32)
+        dotg_t = torch.empty(B, device=device, dtype=torch.float32)
+        h_t    = torch.empty(B, device=device, dtype=torch.float32)
+        doth_t = torch.empty(B, device=device, dtype=torch.float32)
+
+        for lbl in class_ids.unique():
+            lbl_int = int(lbl.item())
+            mask = (class_ids == lbl_int)
+            if not mask.any():
+                continue
+            key = str(lbl_int)
+
+            g_t_m, dotg_t_m = g_fn[key].g_and_grad(t_vec[mask])
+            h_t_m, doth_t_m = h_fn[key].g_and_grad(t_vec[mask])
+
+            g_t[mask]    = g_t_m
+            dotg_t[mask] = dotg_t_m
+            h_t[mask]    = h_t_m
+            doth_t[mask] = doth_t_m
+
+    else:
+        g_t, dotg_t = g_fn.g_and_grad(t_vec)
+        h_t, doth_t = h_fn.g_and_grad(t_vec)
+
+    if dataset == 'cifar10':
+        c = 0.5
+    elif dataset == 'afhqv2':
+        c = 2
+    else:
+        c = 1
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)        
+    x_noisy = images + mat_mul((g_t,h_t), flownet.V, eps, power=0.5, identity_scaling=0.0)
+    flow_at_x = flownet(x_noisy, (g_t.detach(),h_t.detach()), class_labels=labels)
+
+    target_flow = mat_mul((1/(g_t**0.5),1/(h_t**0.5)), flownet.V, images - x_noisy, power=1.0, identity_scaling=0.0) 
+
+    # following loss does not back-prop through flownet to get time.
+    flow_error_vec = mat_mul(((dotg_t)/(g_t**0.5)/(g_t+c)**0.5,(doth_t)/(h_t**0.5)/(h_t+c)**0.5), flownet.V, flow_at_x - target_flow, power=1.0, identity_scaling=0.0) 
+    loss = flow_error_vec.pow(2).sum(dim=[1,2,3]).sum()
+    
+    # now, manually compute del_theta flow(x;theta):
+    #del_theta_flow = estimate_flow_derivative_gh(flownet, x_noisy, (g_t, h_t), (dotg_t, doth_t), labels, flow_at_x.detach())
+    del_flow_loss = 2 * mat_mul(((dotg_t**2)/(g_t)/(g_t+c),(doth_t**2)/(h_t)/(h_t+c)), flownet.V, flow_at_x - target_flow, power=1.0, identity_scaling=0.0).detach()
+    
+    additional_loss = create_flow_derivative_gh_term_debug(flownet, x_noisy, (g_t, h_t), (dotg_t, doth_t), labels, flow_at_x, del_flow_loss)
+
+    # additional loss term
+    #additional_loss = torch.einsum('BCHW,BCHW->B',(del_flow_loss, del_theta_flow)).sum()
+    assert additional_loss.item()==0
+
+    loss = loss + additional_loss
+
+    return loss
+
+def flow_matching_energy_debug_basis(
+    flownet,
+    images,
+    labels,
+    g_fn,
+    h_fn,
+    dataset,
+    T,
+    tmin=1e-9,
+    V_by_label=None,
+    V_global=None,
+):
+    """
+    images : [B,C,H,W]  in [-1,1]
+    returns scalar loss (sum over batch)
+    """
+
+    B, _, _, _ = images.shape
+    device = images.device
+
+    # constants
+    c = 0.5 if dataset == 'cifar10' else 1.0
+
+    # sample t
+    t_vec = torch.rand(B, device=device) * (T - tmin) + tmin
+    g_t, dotg_t = g_fn.g_and_grad(t_vec)
+    h_t, doth_t = h_fn.g_and_grad(t_vec)
+
+    # ------------------------------------------------------------
+    # IMPORTANT: keep two versions of labels
+    #   labels_oh  : for UNet conditioning (one-hot or None)
+    #   labels_idx : for masking / choosing V_y (integer indices)
+    # ------------------------------------------------------------
+    labels_oh = None
+    labels_idx = None
+    if labels is not None:
+        labels_oh = labels.detach()
+        if labels_oh.ndim > 1:
+            labels_idx = labels_oh.argmax(dim=1)
+        else:
+            labels_idx = labels_oh  # already indices
+
+    total_loss = images.new_tensor(0.0)
+
+    # --------- helper: compute loss for a given subset ---------
+    def compute_subset_loss(x, lbl_oh, gt, dgt, ht, dht, V):
+        eps = torch.randn_like(x)
+
+        x_noisy = x + mat_mul(
+            (gt, ht), V, eps, power=0.5, identity_scaling=0.0
+        )
+
+        flow_at_x = flownet(
+            x_noisy,
+            (gt.detach(), ht.detach()),
+            V=V,
+            class_labels=lbl_oh,   # <<< MUST be one-hot (for cifar10) or None
+        )
+
+        target_flow = mat_mul(
+            (1 / gt.sqrt(), 1 / ht.sqrt()),
+            V,
+            x - x_noisy,
+            power=1.0,
+            identity_scaling=0.0,
+        )
+
+        flow_error_vec = mat_mul(
+            (
+                dgt / gt.sqrt() / (gt + c).sqrt(),
+                dht / ht.sqrt() / (ht + c).sqrt(),
+            ),
+            V,
+            flow_at_x - target_flow,
+            power=1.0,
+            identity_scaling=0.0,
+        )
+
+        loss = flow_error_vec.pow(2).sum(dim=[1, 2, 3]).sum()
+
+        del_flow_loss = (
+            2
+            * mat_mul(
+                (
+                    dgt**2 / gt / (gt + c),
+                    dht**2 / ht / (ht + c),
+                ),
+                V,
+                flow_at_x - target_flow,
+                power=1.0,
+                identity_scaling=0.0,
+            ).detach()
+        )
+
+        additional_loss = create_flow_derivative_gh_term_debug_basis(
+            flownet,
+            x_noisy,
+            (gt, ht),
+            (dgt, dht),
+            lbl_oh,          # keep consistent with flownet conditioning
+            flow_at_x,
+            del_flow_loss,
+            V=V,
+        )
+
+        assert additional_loss.item() == 0
+        return loss + additional_loss
+
+    # --------- unconditional case ---------
+    if labels is None or V_by_label is None:
+        assert V_global is not None, "Need V_global for unconditional training"
+        return compute_subset_loss(
+            images,
+            None,            # no class conditioning
+            g_t, dotg_t,
+            h_t, doth_t,
+            V_global,
+        )
+
+    # --------- conditional / per-label PCA ---------
+    # labels_idx is [B] int, labels_oh is [B,10] (cifar10) or [B] (if you use indices)
+    for y in torch.unique(labels_idx):
+        y_int = int(y.item())
+        mask = (labels_idx == y_int)
+        if mask.sum() == 0:
+            continue
+
+        # subset labels passed to flownet must match its expected format:
+        # - cifar10: one-hot [b,10]
+        # - if you ever switch to index-conditioning, you can adapt flownet.forward
+        lbl_sub = None
+        if labels_oh is not None:
+            lbl_sub = labels_oh[mask]
+
+            # ---- FORCE one-hot for UNet conditioning ----
+            if lbl_sub.ndim == 1:
+                lbl_sub = torch.nn.functional.one_hot(
+                    lbl_sub.to(torch.long),
+                    num_classes=flownet.label_dim,
+                ).to(lbl_sub.device)
+
+        total_loss = total_loss + compute_subset_loss(
+            images[mask],
+            lbl_sub,
+            g_t[mask], dotg_t[mask],
+            h_t[mask], doth_t[mask],
+            V_by_label[y_int],
+        )
+
+    return total_loss
+
+
+def flow_matching_energy_debug_basis_v2(
+    flownet,
+    images,
+    labels,          # one-hot or None
+    g_fn,
+    h_fn,
+    dataset,
+    T,
+    V,               # <<< NEW: Tensor or Dict[int, Tensor]
+    tmin=1e-9,
+):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns scalar loss (sum over batch)
+    """
+
+    if isinstance(flownet, torch.nn.parallel.DistributedDataParallel):
+        flownet = flownet.module
+
+    B, _, _, _ = images.shape
+    device = images.device
+
+    # --------------------------------------------------
+    # sample time
+    # --------------------------------------------------
+    t_vec = torch.rand(B, device=device) * (T - tmin) + tmin
+    g_t, dotg_t = g_fn.g_and_grad(t_vec)
+    h_t, doth_t = h_fn.g_and_grad(t_vec)
+
+    # --------------------------------------------------
+    # dataset constant
+    # --------------------------------------------------
+    if dataset == 'cifar10':
+        c = 0.5
+    elif dataset == 'afhqv2':
+        c = 2
+    else:
+        c = 1
+
+    # --------------------------------------------------
+    # labels -> labels_id
+    # --------------------------------------------------
+    labels_id = None
+    if labels is not None:
+        labels = labels.detach()
+        labels_id = labels.argmax(dim=1)
+
+    # --------------------------------------------------
+    # forward diffusion
+    # --------------------------------------------------
+    eps = torch.randn_like(images)
+
+    x_noisy = images + mat_mul_labelwise(
+        (g_t, h_t),
+        V,
+        eps,
+        labels=labels_id,
+        power=0.5,
+        identity_scaling=0.0,
+    )
+
+    # --------------------------------------------------
+    # model flow
+    # --------------------------------------------------
+    flow_at_x = flownet(
+        x_noisy,
+        (g_t.detach(), h_t.detach()),
+        V,
+        class_labels=labels,
+    )
+
+    # --------------------------------------------------
+    # target flow
+    # --------------------------------------------------
+    target_flow = mat_mul_labelwise(
+        (1 / g_t.sqrt(), 1 / h_t.sqrt()),
+        V,
+        images - x_noisy,
+        labels=labels_id,
+        power=1.0,
+        identity_scaling=0.0,
+    )
+
+    # --------------------------------------------------
+    # main flow-matching loss
+    # --------------------------------------------------
+    flow_error_vec = mat_mul_labelwise(
+        (
+            dotg_t / g_t.sqrt() / (g_t + c).sqrt(),
+            doth_t / h_t.sqrt() / (h_t + c).sqrt(),
+        ),
+        V,
+        flow_at_x - target_flow,
+        labels=labels_id,
+        power=1.0,
+        identity_scaling=0.0,
+    )
+
+    loss = flow_error_vec.pow(2).sum(dim=[1, 2, 3]).sum()
+
+    # --------------------------------------------------
+    # second-order term (unchanged structurally)
+    # --------------------------------------------------
+    del_flow_loss = 2 * mat_mul_labelwise(
+        (
+            dotg_t**2 / g_t / (g_t + c),
+            doth_t**2 / h_t / (h_t + c),
+        ),
+        V,
+        flow_at_x - target_flow,
+        labels=labels_id,
+        power=1.0,
+        identity_scaling=0.0,
+    ).detach()
+
+    additional_loss = create_flow_derivative_gh_term_debug(
+        flownet,
+        x_noisy,
+        (g_t, h_t),
+        (dotg_t, doth_t),
+        labels,
+        flow_at_x,
+        del_flow_loss,
+    )
+
+    assert additional_loss.item() == 0
+
+    return loss + additional_loss
+
+def flow_matching_energy_debug_basis_v3(
+    flownet,
+    images,
+    labels_id,   # [B] basis id (0..num_banks-1) or None
+    labels,      # imagenet class labels: Long[B] OR one-hot[B,1000] OR None
+    g_fn,
+    h_fn,
+    dataset,
+    T,
+    V,
+    tmin=1e-9,
+):
+    if isinstance(flownet, torch.nn.parallel.DistributedDataParallel):
+        flownet = flownet.module
+
+    B = images.shape[0]
+    device = images.device
+
+    # ---------------------------
+    # 1) basis labels_id sanity
+    # ---------------------------
+    if isinstance(V, dict):
+        assert labels_id is not None, "V is dict => must pass labels_id (basis ids)"
+        labels_id = labels_id.to(device=device, dtype=torch.long).detach()
+
+        # if you want: labels_id = labels_id % num_banks
+        # but better: enforce range by dict keys
+        max_key = max(V.keys()) if len(V) > 0 else -1
+        if labels_id.min().item() < 0 or labels_id.max().item() > max_key:
+            raise ValueError(
+                f"labels_id out of range: {labels_id.min().item()}..{labels_id.max().item()}, "
+                f"V keys up to {max_key}"
+            )
+    else:
+        # global V tensor: labels_id can be None
+        if labels_id is not None:
+            labels_id = labels_id.to(device=device, dtype=torch.long).detach()
+
+    # ---------------------------
+    # 2) class conditioning labels
+    # ---------------------------
+    # ---------- sanitize class labels ----------
+    class_labels = None
+    if labels is not None:
+        labels = labels.detach().to(device)
+
+        if labels.ndim == 1:
+            # class id -> one-hot (ImageNet)
+            if dataset == "imagenet":
+                class_labels = torch.nn.functional.one_hot(
+                    labels.to(torch.long), num_classes=1000
+                ).to(torch.float32)
+            else:
+                class_labels = None
+
+        elif labels.ndim == 2:
+            # already one-hot
+            class_labels = labels.to(torch.float32)
+
+        else:
+            raise ValueError(f"Unsupported labels shape: {labels.shape}")
+
+
+
+    # ---------------------------
+    # 3) sample time
+    # ---------------------------
+    t_vec = torch.rand(B, device=device) * (T - tmin) + tmin
+    g_t, dotg_t = g_fn.g_and_grad(t_vec)
+    h_t, doth_t = h_fn.g_and_grad(t_vec)
+
+    if dataset == 'cifar10':
+        c = 0.5
+    elif dataset == 'afhqv2':
+        c = 2
+    else:
+        c = 1
+
+    # ---------------------------
+    # 4) forward diffusion
+    # ---------------------------
+    eps = torch.randn_like(images)
+    x_noisy = images + mat_mul_labelwise(
+        (g_t, h_t), V, eps,
+        labels=labels_id,
+        power=0.5,
+        identity_scaling=0.0,
+    )
+
+    # ---------------------------
+    # 5) model flow
+    # ---------------------------
+    flow_at_x = flownet(
+        x_noisy,
+        (g_t.detach(), h_t.detach()),
+        V,
+        labels_id=labels_id,
+        class_labels=class_labels,   # <-- Long[B] (or None)
+    )
+
+    # ---------------------------
+    # 6) target flow
+    # ---------------------------
+    target_flow = mat_mul_labelwise(
+        (1 / g_t.sqrt(), 1 / h_t.sqrt()),
+        V,
+        images - x_noisy,
+        labels=labels_id,
+        power=1.0,
+        identity_scaling=0.0,
+    )
+
+    # ---------------------------
+    # 7) main loss
+    # ---------------------------
+    flow_error_vec = mat_mul_labelwise(
+        (dotg_t / g_t.sqrt() / (g_t + c).sqrt(),
+         doth_t / h_t.sqrt() / (h_t + c).sqrt()),
+        V,
+        flow_at_x - target_flow,
+        labels=labels_id,
+        power=1.0,
+        identity_scaling=0.0,
+    )
+
+    loss = flow_error_vec.pow(2).sum(dim=[1, 2, 3]).sum()
+
+    # ---------------------------
+    # 8) derivative term (unchanged)
+    # ---------------------------
+    del_flow_loss = 2 * mat_mul_labelwise(
+        (dotg_t**2 / g_t / (g_t + c),
+         doth_t**2 / h_t / (h_t + c)),
+        V,
+        flow_at_x - target_flow,
+        labels=labels_id,
+        power=1.0,
+        identity_scaling=0.0,
+    ).detach()
+
+    additional_loss = create_flow_derivative_gh_term_debug_basis_v3(
+        flownet,
+        x_noisy,
+        (g_t, h_t),
+        (dotg_t, doth_t),
+        class_labels,       # <-- Long[B] or None
+        flow_at_x,
+        del_flow_loss,
+        V=V,
+        labels_id=labels_id
+    )
+    assert additional_loss.item() == 0
+
+    return loss + additional_loss
+
+def flow_matching_energy_debug_basis_condition_v3(
+    flownet,
+    images,
+    labels_id,   # [B] basis id (0..num_banks-1) or None
+    labels,      # imagenet class labels: Long[B] OR one-hot[B,1000] OR None
+    g_fn,
+    h_fn,
+    dataset,
+    T,
+    V,
+    tmin=1e-9,
+):
+    if isinstance(flownet, torch.nn.parallel.DistributedDataParallel):
+        flownet = flownet.module
+
+    B = images.shape[0]
+    device = images.device
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    # ---------------------------
+    # 1) basis labels_id sanity
+    # ---------------------------
+    if isinstance(V, dict):
+        assert labels_id is not None, "V is dict => must pass labels_id (basis ids)"
+        labels_id = labels_id.to(device=device, dtype=torch.long).detach()
+
+        # if you want: labels_id = labels_id % num_banks
+        # but better: enforce range by dict keys
+        max_key = max(V.keys()) if len(V) > 0 else -1
+        if labels_id.min().item() < 0 or labels_id.max().item() > max_key:
+            raise ValueError(
+                f"labels_id out of range: {labels_id.min().item()}..{labels_id.max().item()}, "
+                f"V keys up to {max_key}"
+            )
+    else:
+        # global V tensor: labels_id can be None
+        if labels_id is not None:
+            labels_id = labels_id.to(device=device, dtype=torch.long).detach()
+
+    # ---------------------------
+    # 2) class conditioning labels
+    # ---------------------------
+    # ---------- sanitize class labels ----------
+    class_labels = None
+    if labels is not None:
+        labels = labels.detach().to(device)
+
+        if labels.ndim == 1:
+            # class id -> one-hot (ImageNet)
+            if dataset == "imagenet":
+                class_labels = torch.nn.functional.one_hot(
+                    labels.to(torch.long), num_classes=1000
+                ).to(torch.float32)
+            else:
+                class_labels = None
+
+        elif labels.ndim == 2:
+            # already one-hot
+            class_labels = labels.to(torch.float32)
+
+        else:
+            raise ValueError(f"Unsupported labels shape: {labels.shape}")
+
+    is_dict = isinstance(g_fn, (dict, torch.nn.ModuleDict))
+    if is_dict:
+        assert labels_id is not None, "When g_fn is dict/ModuleDict, please pass labels_id (LongTensor [B])."
+        # allocate
+        g_t    = torch.empty(B, device=device, dtype=torch.float32)
+        dotg_t = torch.empty(B, device=device, dtype=torch.float32)
+        h_t    = torch.empty(B, device=device, dtype=torch.float32)
+        doth_t = torch.empty(B, device=device, dtype=torch.float32)
+
+        for lbl in labels_id.unique():
+            lbl_int = int(lbl.item())
+            mask = (labels_id == lbl_int)
+            if not mask.any():
+                continue
+            key = str(lbl_int)
+
+            g_t_m, dotg_t_m = g_fn[key].g_and_grad(t_vec[mask])
+            h_t_m, doth_t_m = h_fn[key].g_and_grad(t_vec[mask])
+
+            g_t[mask]    = g_t_m
+            dotg_t[mask] = dotg_t_m
+            h_t[mask]    = h_t_m
+            doth_t[mask] = doth_t_m
+
+    else:
+        g_t, dotg_t = g_fn.g_and_grad(t_vec)
+        h_t, doth_t = h_fn.g_and_grad(t_vec)
+
+    if dataset == 'cifar10':
+        c = 0.5
+    elif dataset == 'afhqv2':
+        c = 2
+    else:
+        c = 1
+
+    # ---------------------------
+    # 4) forward diffusion
+    # ---------------------------
+    eps = torch.randn_like(images)
+    x_noisy = images + mat_mul_labelwise(
+        (g_t, h_t), V, eps,
+        labels=labels_id,
+        power=0.5,
+        identity_scaling=0.0,
+    )
+
+    # ---------------------------
+    # 5) model flow
+    # ---------------------------
+    flow_at_x = flownet(
+        x_noisy,
+        (g_t.detach(), h_t.detach()),
+        V,
+        labels_id=labels_id,
+        class_labels=class_labels,   # <-- Long[B] (or None)
+    )
+
+    # ---------------------------
+    # 6) target flow
+    # ---------------------------
+    target_flow = mat_mul_labelwise(
+        (1 / g_t.sqrt(), 1 / h_t.sqrt()),
+        V,
+        images - x_noisy,
+        labels=labels_id,
+        power=1.0,
+        identity_scaling=0.0,
+    )
+
+    # ---------------------------
+    # 7) main loss
+    # ---------------------------
+    flow_error_vec = mat_mul_labelwise(
+        (dotg_t / g_t.sqrt() / (g_t + c).sqrt(),
+         doth_t / h_t.sqrt() / (h_t + c).sqrt()),
+        V,
+        flow_at_x - target_flow,
+        labels=labels_id,
+        power=1.0,
+        identity_scaling=0.0,
+    )
+
+    loss = flow_error_vec.pow(2).sum(dim=[1, 2, 3]).sum()
+
+    # ---------------------------
+    # 8) derivative term (unchanged)
+    # ---------------------------
+    del_flow_loss = 2 * mat_mul_labelwise(
+        (dotg_t**2 / g_t / (g_t + c),
+         doth_t**2 / h_t / (h_t + c)),
+        V,
+        flow_at_x - target_flow,
+        labels=labels_id,
+        power=1.0,
+        identity_scaling=0.0,
+    ).detach()
+
+    additional_loss = create_flow_derivative_gh_term_debug_basis_v3(
+        flownet,
+        x_noisy,
+        (g_t, h_t),
+        (dotg_t, doth_t),
+        class_labels,       # <-- Long[B] or None
+        flow_at_x,
+        del_flow_loss,
+        V=V,
+        labels_id=labels_id
+    )
+    assert additional_loss.item() == 0
+
+    return loss + additional_loss
+
+
+def flow_matching_energy_debug_v2(flownet, images, labels, g_fn, h_fn, dataset, T, tmin=1e-9):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns scalar mean loss
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g_t, dotg_t = g_fn.g_and_grad(t_vec)
+    h_t, doth_t = h_fn.g_and_grad(t_vec)
+    if dataset == 'cifar10':
+        c = 0.5
+    elif dataset == 'afhqv2':
+        c = 2
+    else:
+        c = 1
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)
+    x_noisy = images + mat_mul((g_t,h_t), flownet.V, eps, power=0.5, identity_scaling=0.0)
+    flow_at_x = flownet(x_noisy, (g_t.detach(),h_t.detach()), class_labels=labels)
+    target_flow = mat_mul((1/(g_t**0.5),1/(h_t**0.5)), flownet.V, images - x_noisy, power=1.0, identity_scaling=0.0)
+    # following loss does not back-prop through flownet to get time.
+    flow_error_vec = mat_mul(((dotg_t)/(g_t**0.5)/(g_t+c),(doth_t)/(h_t**0.5)/(h_t+c)), flownet.V, flow_at_x - target_flow, power=1.0, identity_scaling=0.0)
+    loss = flow_error_vec.pow(2).sum(dim=[1,2,3]).sum()
+    # now, manually compute del_theta flow(x;theta):
+    #del_theta_flow = estimate_flow_derivative_gh(flownet, x_noisy, (g_t, h_t), (dotg_t, doth_t), labels, flow_at_x.detach())
+    del_flow_loss = 2 * mat_mul(((dotg_t**2)/(g_t)/(g_t+c)**2,(doth_t**2)/(h_t)/(h_t+c)**2), flownet.V, flow_at_x - target_flow, power=1.0, identity_scaling=0.0).detach()
+    additional_loss = create_flow_derivative_gh_term_debug(flownet, x_noisy, (g_t, h_t), (dotg_t, doth_t), labels, flow_at_x, del_flow_loss)
+    # additional loss term
+    #additional_loss = torch.einsum('BCHW,BCHW->B',(del_flow_loss, del_theta_flow)).sum()
+    assert additional_loss.item()==0
+    loss = loss + additional_loss
+    return loss
+
+
+def flow_matching_energy_var_red(flownet, images, labels, g_fn, h_fn, dataset, T, tmin=1e-9):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns scalar mean loss
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g_t, dotg_t = g_fn.g_and_grad(t_vec)
+    h_t, doth_t = h_fn.g_and_grad(t_vec)
+
+    if dataset == 'cifar10':
+        c = 0.5
+    else:
+        c = 1
+    if labels is not None:
+        labels = labels.detach()
+
+    eps = torch.randn_like(images)        
+    x_noisy = images + mat_mul((g_t,h_t), flownet.V, eps, power=0.5, identity_scaling=0.0)
+    flow_at_x = flownet(x_noisy, (g_t.detach(),h_t.detach()), class_labels=labels)
+
+    detached = {k: v.detach() for k,v in flownet.named_parameters()}
+    flow_at_x_detached = functional_call(flownet, detached, (x_noisy, (g_t.detach(), h_t.detach())),
+                         {"class_labels": labels})
+
+    target_flow = mat_mul((1/(g_t**0.5),1/(h_t**0.5)), flownet.V, images - x_noisy, power=1.0, identity_scaling=0.0) 
+
+    # following loss does not back-prop through flownet to get time.
+    flow_error_vec = mat_mul(((dotg_t)/(g_t**0.5)/(g_t+c)**0.5,(doth_t)/(h_t**0.5)/(h_t+c)**0.5), flownet.V, flow_at_x - target_flow, power=1.0, identity_scaling=0.0) 
+    
+    loss = flow_error_vec.pow(2).sum(dim=[1,2,3]).sum()
+
+    loss = (loss 
+            - mat_mul(((dotg_t)/(g_t**0.5)/(g_t+c)**0.5,(doth_t)/(h_t**0.5)/(h_t+c)**0.5), flownet.V, target_flow, power=1.0, identity_scaling=0.0).pow(2).sum(dim=[1,2,3]).sum()
+            + mat_mul(((dotg_t)/(g_t**0.5)/(g_t+c)**0.5,(doth_t)/(h_t**0.5)/(h_t+c)**0.5), flownet.V, flow_at_x_detached, power=1.0, identity_scaling=0.0).pow(2).sum(dim=[1,2,3]).sum())
+    
+    
+    # now, manually compute del_theta flow(x;theta):
+    #del_theta_flow = estimate_flow_derivative_gh(flownet, x_noisy, (g_t, h_t), (dotg_t, doth_t), labels, flow_at_x.detach())
+    del_flow_loss = 2 * mat_mul(((dotg_t**2)/(g_t)/(g_t+c),(doth_t**2)/(h_t)/(h_t+c)), flownet.V, 2* flow_at_x - target_flow, power=1.0, identity_scaling=0.0).detach()
+    
+    additional_loss = create_flow_derivative_gh_term_debug(flownet, x_noisy, (g_t, h_t), (dotg_t, doth_t), labels, flow_at_x, del_flow_loss)
+
+    # additional loss term
+    #additional_loss = torch.einsum('BCHW,BCHW->B',(del_flow_loss, del_theta_flow)).sum()
+    assert additional_loss.item()==0
+
+    loss = loss + additional_loss
+
+    return loss/B
+
+# def flow_matching_edm_like_gh(flownet, images, labels, g_fn, dataset, T, tmin=1e-9, P_mean=-1.2, P_std=1.2, sigma_data=0.5):
+#     B = images.shape[0]
+#     device = images.device
+
+#     # --- EDM-style sampling ---
+#     rnd_normal = torch.randn([B, 1, 1, 1], device=device)
+#     sigma = (rnd_normal * P_std + P_mean).exp()       # [B,1,1,1]
+#     t = (sigma**2).clamp(min=tmin, max=T)             # t = sigma^2
+#     t_vec = t.view(B)                                 # [B]
+
+#     # --- g/h with hard constraint g*h=t^2 ---
+#     g_t, dotg_t = g_fn.g_and_grad(t_vec)              # learned
+#     h_t = (t_vec**2) / g_t
+#     doth_t = (2 * t_vec / g_t) - (t_vec**2 / g_t**2) * dotg_t
+
+#     if labels is not None:
+#         labels = labels.detach()
+
+#     eps = torch.randn_like(images)
+#     x_noisy = images + mat_mul((g_t, h_t), flownet.V, eps, power=0.5, identity_scaling=0.0)
+
+#     flow_at_x = flownet(x_noisy, (g_t.detach(), h_t.detach()), class_labels=labels)
+
+#     target_flow = mat_mul((1/(g_t**0.5), 1/(h_t**0.5)), flownet.V,
+#                           images - x_noisy, power=1.0, identity_scaling=0.0)
+
+#     # --- EDM-like weights ---
+#     weight = (sigma**2 + sigma_data**2) / (sigma * sigma_data)**2   # shape [B,1,1,1] or [B]
+
+#     err = flow_at_x - target_flow
+
+#     M_err = mat_mul((g_t**0.5, h_t**0.5), flownet.V, err, power=1.0, identity_scaling=0.0)
+
+#     loss = (weight.view(B,1,1,1) * M_err.pow(2)).sum(dim=[1,2,3]).mean()
+
+#     weight_ = weight.view(B,1,1,1)
+
+#     del_flow_loss = 2 * weight_ * mat_mul((g_t, h_t), flownet.V, err, power=1.0, identity_scaling=0.0).detach()
+    
+#     additional_loss = create_flow_derivative_gh_term_debug(flownet, x_noisy, (g_t, h_t), (dotg_t, doth_t), labels, flow_at_x, del_flow_loss)
+
+#     # additional loss term
+#     #additional_loss = torch.einsum('BCHW,BCHW->B',(del_flow_loss, del_theta_flow)).sum()
+#     assert additional_loss.item()==0
+
+#     loss = loss + additional_loss
+
+#     return loss
+
+def flow_matching_edm_like_gh(flownet, images, labels, g_fn, dataset, T, tmin=1e-9, P_mean=-1.2, P_std=1.2, sigma_data=0.5):
+    B = images.shape[0]
+    device = images.device
+
+    # --- EDM-style sampling ---
+    rnd_normal = torch.randn([B, 1, 1, 1], device=device)
+    sigma = (rnd_normal * P_std + P_mean).exp()       # [B,1,1,1]
+    t = (sigma**2).clamp(min=tmin, max=T)             # t = sigma^2
+    t_vec = t.view(B)                                 # [B]
+
+    # --- g/h with hard constraint g*h=t^2 ---
+    g_t, dotg_t = g_fn.g_and_grad(t_vec)              # learned
+    h_t = (t_vec**2) / g_t
+    doth_t = (2 * t_vec / g_t) - (t_vec**2 / g_t**2) * dotg_t
+
+    if labels is not None:
+        labels = labels.detach()
+
+    eps = torch.randn_like(images)
+    x_noisy = images + mat_mul((g_t, h_t), flownet.V, eps, power=0.5, identity_scaling=0.0)
+
+    flow_at_x = flownet(x_noisy, (g_t.detach(), h_t.detach()), class_labels=labels)
+
+    target_flow = mat_mul((1/(g_t**0.5), 1/(h_t**0.5)), flownet.V,
+                          images - x_noisy, power=1.0, identity_scaling=0.0)
+
+    # --- EDM-like weights ---
+    weight = sigma**2 * (sigma**2 + sigma_data**2) / (sigma * sigma_data)**2   # shape [B,1,1,1] or [B]
+
+    err = flow_at_x - target_flow
+
+    weight_ = weight.view(B,1,1,1)
+
+    # loss = weight * (err ** 2).sum(dim=[1,2,3]).mean()
+    loss = (weight_ * err.pow(2)).mean()
+
+    del_flow_loss = (2 * weight_ * err).detach()
+    
+    additional_loss = create_flow_derivative_gh_term_debug(flownet, x_noisy, (g_t, h_t), (dotg_t, doth_t), labels, flow_at_x, del_flow_loss)
+
+    # additional loss term
+    #additional_loss = torch.einsum('BCHW,BCHW->B',(del_flow_loss, del_theta_flow)).sum()
+    assert additional_loss.item()==0
+
+    loss = loss + additional_loss
+
+    return loss
+
+# weird implementation quirk, flow_at_x must be computed at x
 def create_flow_derivative_gh_term(flownet, x, gh_t, dot_gh_t, labels, flow_at_x, del_flow_loss):
     dct_V = flownet.V
     B,d1,d2,d3 = x.shape
@@ -613,6 +3496,280 @@ def create_flow_derivative_gh_term(flownet, x, gh_t, dot_gh_t, labels, flow_at_x
     additional_loss = 0.5 * d * dot_del_x_dot_del_x_F_b_ei_Mei + dot_del_x_F_b_Mscore + 0.5 * F_c
 
     return additional_loss-additional_loss.detach()
+
+def create_flow_derivative_gh_term_debug(flownet, x, gh_t, dot_gh_t, labels, flow_at_x, del_flow_loss):
+    dct_V = flownet.V
+    B,d1,d2,d3 = x.shape
+    d = d1*d2*d3
+    g_t, h_t = gh_t
+    dotg_t, doth_t = dot_gh_t
+    assert g_t.shape[0]==B and h_t.shape[0]==B and dotg_t.shape[0]==B and doth_t.shape[0]==B
+
+    # Sample random perturbation directions ei_s for each x:
+    ei = torch.randn_like(x)
+    ei = ei/ei.norm(p=2,dim=(1,2,3))[:,None,None,None]
+
+    # compute the detached flow, if not provided
+    flow_detached = flow_at_x.detach()
+    del_flow_loss = del_flow_loss.detach()
+
+    # compute del_x <del_flow_loss.detach(), flow(x, gh, label)
+    F_b = (del_flow_loss * flow_at_x).sum()
+    (del_x_F_b,) = torch.autograd.grad(F_b, x, create_graph=True, retain_graph=True)
+    
+    ################################################################
+    # 1. form derivative term involving drds flow(x + rei + sdel_theta M ei)
+    ################################################################
+    dot_del_x_F_b_ei = (del_x_F_b * ei).sum()
+    (del_x_dot_del_x_F_b_ei,) = torch.autograd.grad(dot_del_x_F_b_ei, x, create_graph=False, retain_graph=True)
+    dot_del_x_dot_del_x_F_b_ei_Mei = (del_x_dot_del_x_F_b_ei.detach() * mat_mul((g_t, h_t), dct_V, ei, power=1.0, identity_scaling=0.0)).sum()
+
+    ################################################################
+    # 2. form derivative term involving ds flow(x + sdel_theta M score)
+    ################################################################
+    dot_del_x_F_b_Mscore = (del_x_F_b.detach() * mat_mul((g_t*g_t.detach()**(-0.5), h_t*h_t.detach()**(-0.5)), dct_V, flow_detached, power=1.0, identity_scaling=0.0)).sum()
+    ################################################################
+    # 3. form derivative term involving dtheta M
+    ################################################################
+    F_c = (del_flow_loss * mat_mul((g_t/g_t.detach(), h_t/h_t.detach()), dct_V, flow_detached, power=1.0, identity_scaling=0.0)).sum()
+
+    ########################################
+    # 4. Combining everything
+    ########################################
+    additional_loss = 0.5 * d * dot_del_x_dot_del_x_F_b_ei_Mei + dot_del_x_F_b_Mscore + 0.5 * F_c
+
+    return additional_loss-additional_loss.detach()
+
+def create_flow_derivative_gh_term_debug_basis(
+    flownet,
+    x,
+    gh_t,
+    dot_gh_t,
+    labels,
+    flow_at_x,
+    del_flow_loss,
+    V,
+):
+    """
+    Basis-aware version.
+    flownet does NOT store V anymore.
+    """
+
+    assert V is not None, "V must be provided (flownet no longer owns V)"
+
+    B, d1, d2, d3 = x.shape
+    d = d1 * d2 * d3
+
+    g_t, h_t = gh_t
+    dotg_t, doth_t = dot_gh_t
+    assert g_t.shape[0] == B and h_t.shape[0] == B
+    assert dotg_t.shape[0] == B and doth_t.shape[0] == B
+
+    # ------------------------------------------------------------
+    # Sample random perturbation directions e_i (unit norm)
+    # ------------------------------------------------------------
+    ei = torch.randn_like(x)
+    ei = ei / ei.norm(p=2, dim=(1, 2, 3), keepdim=True)
+
+    # Detached quantities
+    flow_detached = flow_at_x.detach()
+    del_flow_loss = del_flow_loss.detach()
+
+    # ------------------------------------------------------------
+    # Compute ∂_x <del_flow_loss, flow(x)>
+    # ------------------------------------------------------------
+    F_b = (del_flow_loss * flow_at_x).sum()
+    (del_x_F_b,) = torch.autograd.grad(
+        F_b, x, create_graph=True, retain_graph=True
+    )
+
+    ################################################################
+    # 1. Term involving d/ds flow(x + r e_i + s dθ M e_i)
+    ################################################################
+    dot_del_x_F_b_ei = (del_x_F_b * ei).sum()
+    (del_x_dot_del_x_F_b_ei,) = torch.autograd.grad(
+        dot_del_x_F_b_ei, x, create_graph=False, retain_graph=True
+    )
+
+    dot_del_x_dot_del_x_F_b_ei_Mei = (
+        del_x_dot_del_x_F_b_ei.detach()
+        * mat_mul(
+            (g_t, h_t),
+            V,
+            ei,
+            power=1.0,
+            identity_scaling=0.0,
+        )
+    ).sum()
+
+    ################################################################
+    # 2. Term involving d/ds flow(x + s dθ M score)
+    ################################################################
+    dot_del_x_F_b_Mscore = (
+        del_x_F_b.detach()
+        * mat_mul(
+            (
+                g_t * g_t.detach().pow(-0.5),
+                h_t * h_t.detach().pow(-0.5),
+            ),
+            V,
+            flow_detached,
+            power=1.0,
+            identity_scaling=0.0,
+        )
+    ).sum()
+
+    ################################################################
+    # 3. Term involving dθ M
+    ################################################################
+    F_c = (
+        del_flow_loss
+        * mat_mul(
+            (
+                g_t / g_t.detach(),
+                h_t / h_t.detach(),
+            ),
+            V,
+            flow_detached,
+            power=1.0,
+            identity_scaling=0.0,
+        )
+    ).sum()
+
+    ################################################################
+    # 4. Combine everything
+    ################################################################
+    additional_loss = (
+        0.5 * d * dot_del_x_dot_del_x_F_b_ei_Mei
+        + dot_del_x_F_b_Mscore
+        + 0.5 * F_c
+    )
+
+    # Stop gradient (debug-style term)
+    return additional_loss - additional_loss.detach()
+
+def create_flow_derivative_gh_term_debug_basis_v3(flownet, x, gh_t, dot_gh_t, labels, flow_at_x, del_flow_loss, V, labels_id=None):
+    if isinstance(V, dict):
+        assert labels_id is not None, "V is dict => must pass labels_id (Long[B])"
+        labels_id = labels_id.detach().to(device=x.device, dtype=torch.long)
+        dct_V = V
+
+    B,d1,d2,d3 = x.shape
+    d = d1*d2*d3
+    g_t, h_t = gh_t
+    dotg_t, doth_t = dot_gh_t
+    assert g_t.shape[0]==B and h_t.shape[0]==B and dotg_t.shape[0]==B and doth_t.shape[0]==B
+
+    # Sample random perturbation directions ei_s for each x:
+    ei = torch.randn_like(x)
+    ei = ei/ei.norm(p=2,dim=(1,2,3))[:,None,None,None]
+
+    # compute the detached flow, if not provided
+    flow_detached = flow_at_x.detach()
+    del_flow_loss = del_flow_loss.detach()
+
+    # compute del_x <del_flow_loss.detach(), flow(x, gh, label)
+    F_b = (del_flow_loss * flow_at_x).sum()
+    (del_x_F_b,) = torch.autograd.grad(F_b, x, create_graph=True, retain_graph=True)
+    
+    ################################################################
+    # 1. form derivative term involving drds flow(x + rei + sdel_theta M ei)
+    ################################################################
+    dot_del_x_F_b_ei = (del_x_F_b * ei).sum()
+    (del_x_dot_del_x_F_b_ei,) = torch.autograd.grad(dot_del_x_F_b_ei, x, create_graph=False, retain_graph=True)
+    dot_del_x_dot_del_x_F_b_ei_Mei = (del_x_dot_del_x_F_b_ei.detach() * mat_mul_labelwise((g_t, h_t), dct_V, ei, labels=labels_id, power=1.0, identity_scaling=0.0)).sum()
+
+    ################################################################
+    # 2. form derivative term involving ds flow(x + sdel_theta M score)
+    ################################################################
+    dot_del_x_F_b_Mscore = (del_x_F_b.detach() * mat_mul_labelwise((g_t*g_t.detach()**(-0.5), h_t*h_t.detach()**(-0.5)), dct_V, flow_detached, labels=labels_id, power=1.0, identity_scaling=0.0)).sum()
+    ################################################################
+    # 3. form derivative term involving dtheta M
+    ################################################################
+    F_c = (del_flow_loss * mat_mul_labelwise((g_t/g_t.detach(), h_t/h_t.detach()), dct_V, flow_detached, labels=labels_id, power=1.0, identity_scaling=0.0)).sum()
+    ########################################
+    # 4. Combining everything
+    ########################################
+    additional_loss = 0.5 * d * dot_del_x_dot_del_x_F_b_ei_Mei + dot_del_x_F_b_Mscore + 0.5 * F_c
+
+    return additional_loss-additional_loss.detach()
+
+def ANILoss_gh_energy_all_version7wud(edmnet, images, labels, g_fn, h_fn, T, tmin=1e-9, disc_mult=1.0):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns per-pixel squared error tensor (identical convention as EDMLoss)
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g, dot_g = g_fn.g_and_grad(t_vec)
+    h, dot_h = h_fn.g_and_grad(t_vec)
+
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)        #eps ~ N(0,I)
+    x_noisy = images + mat_mul((g,h), edmnet.V, eps, power=0.5, identity_scaling=0.0)
+    
+    #####################
+    ### compute detached score
+    #####################
+    detached = {k: v.detach() for k,v in edmnet.named_parameters()}
+    M_times_score_detached = functional_call(edmnet, detached, (x_noisy, (g, h)),
+                         {"class_labels": labels}) - x_noisy
+    
+    #####################
+    ### dotgsqogsqogp1: loss wrt true score  (3.1 FID)
+    #####################
+    scaled_net_score = mat_mul((dot_g/(g)/((g+0.5)**0.5),dot_h/(h)/((h+0.5)**0.5)), edmnet.V, M_times_score_detached) 
+    scaled_true_noisy_score = mat_mul((dot_g/(g)/((g+0.5)**0.5),dot_h/(h)/((h+0.5)**0.5)), edmnet.V, images-x_noisy) 
+
+    loss = (scaled_true_noisy_score - scaled_net_score).pow(2).sum(dim=[1,2,3]).mean() 
+
+    loss = loss - (scaled_true_noisy_score).pow(2).sum(dim=[1,2,3]).mean() + (scaled_net_score).pow(2).sum(dim=[1,2,3]).mean()
+
+    #####################
+    ### loss wrt discretization
+    #####################
+    interval = 6400.0/8
+    delta = (torch.rand(t_vec.shape,device=device)) * interval
+    #delta = (torch.rand(t_vec.shape,device=device)*0.5+0.5) * interval
+    t_vec_target = torch.clamp(t_vec - delta, min=1e-9, max=6400)
+
+    t_vec_next = t_vec + 0.5 * (t_vec_target - t_vec)
+
+    g_next, _ = g_fn.g_and_grad(t_vec_next)
+    h_next, _ = h_fn.g_and_grad(t_vec_next)
+
+    t_rand_mid = t_vec + torch.rand(t_vec.shape,device=device) * (t_vec_target - t_vec) 
+    g_rand_mid, dotg_rand_mid = g_fn.g_and_grad(t_rand_mid)
+    h_rand_mid, doth_rand_mid = h_fn.g_and_grad(t_rand_mid)
+    
+    # compute update direction
+    flow_dir = mat_mul((g, h), edmnet.V, M_times_score_detached, power = -0.5)
+    x_next = x_noisy + mat_mul((g_next.sqrt() - g.sqrt(), h_next.sqrt() - h.sqrt()), 
+                      edmnet.V, -flow_dir, power = 1.0)
+    M_times_score_next_detached = functional_call(edmnet, detached, (x_next, (g_next, h_next)),
+                         {"class_labels": labels}) - x_next
+    flow_dir_next = mat_mul((g_next, h_next), edmnet.V, M_times_score_next_detached, power = -0.5)
+
+    dt_flow_dir = mat_mul((1/(g_next.sqrt()-g.sqrt()),1/(h_next.sqrt()-h.sqrt())), edmnet.V, 0.5 * (flow_dir_next - flow_dir)) 
+    displacement_at_t_mid = (mat_mul((g_rand_mid.sqrt()-g.sqrt(),h_rand_mid.sqrt()-h.sqrt()), edmnet.V, - flow_dir) 
+                     + mat_mul(((g_rand_mid.sqrt()-g.sqrt())**2,(h_rand_mid.sqrt()-h.sqrt())**2), edmnet.V, - 0.5 * dt_flow_dir))
+    x_rand_mid = x_noisy + displacement_at_t_mid
+    
+    velocity_at_t_mid = mat_mul((dotg_rand_mid/(g_rand_mid**0.5),doth_rand_mid/(h_rand_mid**0.5)), edmnet.V, 
+                     - flow_dir + mat_mul(((g_rand_mid.sqrt()-g.sqrt()),(h_rand_mid.sqrt()-h.sqrt())), edmnet.V, - dt_flow_dir))
+
+    M_times_score_rand_mid = functional_call(edmnet, detached, (x_rand_mid, (g_rand_mid, h_rand_mid)),
+                         {"class_labels": labels}) - x_rand_mid
+    
+    true_velocity_at_t_mid = mat_mul((dotg_rand_mid/g_rand_mid,doth_rand_mid/h_rand_mid), edmnet.V, - M_times_score_rand_mid) 
+
+    disc_err = mat_mul((1/(g_rand_mid+0.5)**0.5,1/(h_rand_mid+0.5)**0.5), edmnet.V, velocity_at_t_mid - true_velocity_at_t_mid)
+    
+    loss = loss + disc_err.norm(p=2,dim=[1,2,3]).pow(2).mean()
+    return loss
 
 
 def stiefel_project_polar(V_raw: torch.Tensor) -> torch.Tensor:
@@ -922,3 +4079,1267 @@ class c_wrapper_h(nn.Module):
     
     def g_and_grad(self, t):
         return self.forward(t)
+
+def flow_matching_energy_variance(flownet, images, labels, g_fn, h_fn, T, tmin=1e-9):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns scalar mean loss
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g_t, dotg_t = g_fn.g_and_grad(t_vec)
+    h_t, doth_t = h_fn.g_and_grad(t_vec)
+
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)        
+    x_noisy = images + mat_mul((g_t,h_t), flownet.V, eps, power=0.5, identity_scaling=0.0)
+    flow_at_x = flownet(x_noisy, (g_t.detach(),h_t.detach()), class_labels=labels)
+
+    detached = {k: v.detach() for k,v in flownet.named_parameters()}
+    flow_at_x_detached = functional_call(flownet, detached, (x_noisy, (g_t.detach(), h_t.detach())),
+                         {"class_labels": labels})
+
+    target_flow = mat_mul((1/(g_t**0.5),1/(h_t**0.5)), flownet.V, images - x_noisy, power=1.0, identity_scaling=0.0) 
+
+    # following loss does not back-prop through flownet to get time.
+    flow_error_vec = mat_mul(((dotg_t)/(g_t**0.5)/(g_t+0.5)**0.5,(doth_t)/(h_t**0.5)/(h_t+0.5)**0.5), flownet.V, flow_at_x - target_flow, power=1.0, identity_scaling=0.0) 
+    
+    loss = flow_error_vec.pow(2).sum(dim=[1,2,3]).sum()
+
+    loss = (loss 
+            - mat_mul(((dotg_t)/(g_t**0.5)/(g_t+0.5)**0.5,(doth_t)/(h_t**0.5)/(h_t+0.5)**0.5), flownet.V, target_flow, power=1.0, identity_scaling=0.0).pow(2).sum(dim=[1,2,3]).sum()
+            + mat_mul(((dotg_t)/(g_t**0.5)/(g_t+0.5)**0.5,(doth_t)/(h_t**0.5)/(h_t+0.5)**0.5), flownet.V, flow_at_x_detached, power=1.0, identity_scaling=0.0).pow(2).sum(dim=[1,2,3]).sum())
+    
+    
+    # now, manually compute del_theta flow(x;theta):
+    #del_theta_flow = estimate_flow_derivative_gh(flownet, x_noisy, (g_t, h_t), (dotg_t, doth_t), labels, flow_at_x.detach())
+    del_flow_loss = 2 * mat_mul(((dotg_t**2)/(g_t)/(g_t+0.5),(doth_t**2)/(h_t)/(h_t+0.5)), flownet.V, 2* flow_at_x - target_flow, power=1.0, identity_scaling=0.0).detach()
+    
+    additional_loss = create_flow_derivative_gh_term(flownet, x_noisy, (g_t, h_t), (dotg_t, doth_t), labels, flow_at_x, del_flow_loss)
+
+    # additional loss term
+    #additional_loss = torch.einsum('BCHW,BCHW->B',(del_flow_loss, del_theta_flow)).sum()
+    assert additional_loss.item()==0
+
+    loss = loss + additional_loss
+
+    return loss/B
+
+## 3
+def ANILoss_gh_energy_variance_reduce(edmnet, images, labels, g_fn, h_fn, T, tmin=1e-9, disc_mult=1.0):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns per-pixel squared error tensor (identical convention as EDMLoss)
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g, dot_g = g_fn.g_and_grad(t_vec)
+    h, dot_h = h_fn.g_and_grad(t_vec)
+
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)        #eps ~ N(0,I)
+    x_noisy = images + mat_mul((g,h), edmnet.V, eps, power=0.5, identity_scaling=0.0)
+    
+    #####################
+    ### compute detached score
+    #####################
+    detached = {k: v.detach() for k,v in edmnet.named_parameters()}
+    M_times_score_detached = functional_call(edmnet, detached, (x_noisy, (g, h)),
+                         {"class_labels": labels}) - x_noisy
+    # M_times_score = edmnet(detached, (x_noisy, (g, h)), class_labels=labels) - x_noisy # @Pengxi: compute undetached schore
+    M_times_score = edmnet(x_noisy, (g, h), class_labels=labels) - x_noisy
+
+    #####################
+    ### dotgsqogsqogp1: loss wrt true score  (3.1 FID)
+    #####################
+    scaled_net_score_detached = mat_mul((dot_g/(g)/((g+0.5)**0.5),dot_h/(h)/((h+0.5)**0.5)), edmnet.V, M_times_score_detached) # @Pengxi: computed detached scaled score
+    scaled_net_score = mat_mul((dot_g/(g)/((g+0.5)**0.5),dot_h/(h)/((h+0.5)**0.5)), edmnet.V, M_times_score) # @Pengxi: computed undetached scaled score
+    scaled_true_noisy_score = mat_mul((dot_g/(g)/((g+0.5)**0.5),dot_h/(h)/((h+0.5)**0.5)), edmnet.V, images-x_noisy) # @Pengxi: loss uses undetached scaled score
+
+    loss = (scaled_true_noisy_score - scaled_net_score).pow(2).sum(dim=[1,2,3]).mean() 
+
+    loss = loss - (scaled_true_noisy_score).pow(2).sum(dim=[1,2,3]).mean() + (scaled_net_score_detached).pow(2).sum(dim=[1,2,3]).mean() # @Pengxi: variance reduction uses detached scoled score
+
+    loss = loss
+
+    return loss
+
+## 4
+def ANILoss_gh_energy_train_plus_discretization(edmnet, images, labels, g_fn, h_fn, T, tmin=1e-9, disc_mult=1.0):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns per-pixel squared error tensor (identical convention as EDMLoss)
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g, dot_g = g_fn.g_and_grad(t_vec)
+    h, dot_h = h_fn.g_and_grad(t_vec)
+
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)        #eps ~ N(0,I)
+    x_noisy = images + mat_mul((g,h), edmnet.V, eps, power=0.5, identity_scaling=0.0)
+    
+    #####################
+    ### compute detached score
+    #####################
+    detached = {k: v.detach() for k,v in edmnet.named_parameters()}
+    M_times_score_detached = functional_call(edmnet, detached, (x_noisy, (g, h)),
+                         {"class_labels": labels}) - x_noisy
+    M_times_score = edmnet(x_noisy, (g, h), class_labels=labels) - x_noisy
+    # M_times_score = edmnet(detached, (x_noisy, (g, h)), class_labels=labels) - x_noisy # @Pengxi: compute undetached schore
+    
+    #####################
+    ### dotgsqogsqogp1: loss wrt true score  (3.1 FID)
+    #####################
+    scaled_net_score_detached = mat_mul((dot_g/(g)/((g+0.5)**0.5),dot_h/(h)/((h+0.5)**0.5)), edmnet.V, M_times_score_detached) # @Pengxi: computed detached scaled score
+    scaled_net_score = mat_mul((dot_g/(g)/((g+0.5)**0.5),dot_h/(h)/((h+0.5)**0.5)), edmnet.V, M_times_score) # @Pengxi: computed undetached scaled score
+    scaled_true_noisy_score = mat_mul((dot_g/(g)/((g+0.5)**0.5),dot_h/(h)/((h+0.5)**0.5)), edmnet.V, images-x_noisy) # @Pengxi: loss uses undetached scaled score
+
+    loss = (scaled_true_noisy_score - scaled_net_score).pow(2).sum(dim=[1,2,3]).mean() 
+
+    loss = loss - (scaled_true_noisy_score).pow(2).sum(dim=[1,2,3]).mean() + (scaled_net_score_detached).pow(2).sum(dim=[1,2,3]).mean() # @Pengxi: variance reduction uses detached scoled score
+
+    loss = loss
+
+    #####################
+    ### loss wrt discretization
+    #####################
+    interval = 6400.0/8
+    delta = (torch.rand(t_vec.shape,device=device)) * interval
+    #delta = (torch.rand(t_vec.shape,device=device)*0.5+0.5) * interval
+    t_vec_target = torch.clamp(t_vec - delta, min=1e-9, max=6400)
+
+    t_vec_next = t_vec + 0.5 * (t_vec_target - t_vec)
+
+    # print(f'eval_times: {eval_times}') #delete after checking
+    print(f'delta: {delta}') #delete after checking
+    print(f't_vec_target: {t_vec_target}') #delete after checking
+    print(f't_vec_next: {t_vec_next}') #delete after checking
+    assert False
+
+    g_next, _ = g_fn.g_and_grad(t_vec_next)
+    h_next, _ = h_fn.g_and_grad(t_vec_next)
+
+    t_rand_mid = t_vec + torch.rand(t_vec.shape,device=device) * (t_vec_target - t_vec) 
+    g_rand_mid, dotg_rand_mid = g_fn.g_and_grad(t_rand_mid)
+    h_rand_mid, doth_rand_mid = h_fn.g_and_grad(t_rand_mid)
+    
+    #g_next = (g.sqrt()-(dot_g/g.sqrt() *delta))**2
+    #h_next = (h.sqrt()-(dot_h/h.sqrt() *delta))**2
+    
+    # compute update direction
+    flow_dir = mat_mul((g, h), edmnet.V, M_times_score_detached, power = -0.5)
+    x_next = x_noisy + mat_mul((g_next.sqrt() - g.sqrt(), h_next.sqrt() - h.sqrt()), 
+                      edmnet.V, -flow_dir, power = 1.0)
+    M_times_score_next_detached = functional_call(edmnet, detached, (x_next, (g_next, h_next)),
+                         {"class_labels": labels}) - x_next
+    flow_dir_next = mat_mul((g_next, h_next), edmnet.V, M_times_score_next_detached, power = -0.5)
+
+    # estimate d/ds flow
+    dt_flow_dir = mat_mul((1/(g_next.sqrt()-g.sqrt()),1/(h_next.sqrt()-h.sqrt())), edmnet.V, 0.5 * (flow_dir_next - flow_dir)) 
+
+    #disc_err = mat_mul(((dot_g)/(g**0.5)/((g+1)**0.5),(dot_h)/(h**0.5)/((h+1)**0.5)), edmnet.V, (flow_dir - flow_dir_next)) 
+
+    displacement_at_t_mid = (mat_mul((g_rand_mid.sqrt()-g.sqrt(),h_rand_mid.sqrt()-h.sqrt()), edmnet.V, - flow_dir) 
+                     + mat_mul(((g_rand_mid.sqrt()-g.sqrt())**2,(h_rand_mid.sqrt()-h.sqrt())**2), edmnet.V, - 0.5 * dt_flow_dir))
+    x_rand_mid = x_noisy + displacement_at_t_mid
+    
+    velocity_at_t_mid = mat_mul((dotg_rand_mid/(g_rand_mid**0.5),doth_rand_mid/(h_rand_mid**0.5)), edmnet.V, 
+                     - flow_dir + mat_mul(((g_rand_mid.sqrt()-g.sqrt()),(h_rand_mid.sqrt()-h.sqrt())), edmnet.V, - dt_flow_dir))
+
+    M_times_score_rand_mid = functional_call(edmnet, detached, (x_rand_mid, (g_rand_mid, h_rand_mid)),
+                         {"class_labels": labels}) - x_rand_mid
+    
+    true_velocity_at_t_mid = mat_mul((dotg_rand_mid/g_rand_mid,doth_rand_mid/h_rand_mid), edmnet.V, - M_times_score_rand_mid) 
+
+    disc_err = mat_mul((1/(g_rand_mid+0.5)**0.5,1/(h_rand_mid+0.5)**0.5), edmnet.V, velocity_at_t_mid - true_velocity_at_t_mid)
+    
+    loss = loss + disc_err.norm(p=2,dim=[1,2,3]).pow(2).mean()
+    return loss
+
+def ANILoss_gh_energy_largesigmadata(edmnet, images, labels, g_fn, h_fn, T, tmin=1e-9):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns per-pixel squared error tensor (identical convention as EDMLoss)
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g, dot_g = g_fn.g_and_grad(t_vec)
+    h, dot_h = h_fn.g_and_grad(t_vec)
+    g = g
+    h = h
+    dot_g = dot_g
+    dot_h = dot_h
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)        #eps ~ N(0,I)
+    x_noisy = images + mat_mul((g,h), edmnet.V, eps, power=0.5, identity_scaling=0.0)
+    den = edmnet(x_noisy, (g,h), class_labels=labels)
+    diff = den - images     # model residual
+    sigma_data = 4
+    #this line updated
+    weighted_diff = mat_mul(((dot_g**2)/(g**2)/(g+sigma_data**2),(dot_h**2)/(h**2)/(h+sigma_data**2)), edmnet.V, diff, power=0.5, identity_scaling=0.0) 
+    loss = weighted_diff.pow(2).sum(dim=[1,2,3])
+    return loss.mean()
+
+def ANILoss_gh_energy_dotgsqogsq(edmnet, images, labels, g_fn, h_fn, T, tmin=1e-9):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns per-pixel squared error tensor (identical convention as EDMLoss)
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g, dot_g = g_fn.g_and_grad(t_vec)
+    h, dot_h = h_fn.g_and_grad(t_vec)
+    g = g
+    h = h
+    dot_g = dot_g
+    dot_h = dot_h
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)        #eps ~ N(0,I)
+    x_noisy = images + mat_mul((g,h), edmnet.V, eps, power=0.5, identity_scaling=0.0)
+    den = edmnet(x_noisy, (g,h), class_labels=labels)
+    diff = den - images     # model residual
+    #this line updated
+    weighted_diff = mat_mul(((dot_g**2)/(g**2),(dot_h**2)/(h**2)), edmnet.V, diff, power=0.5, identity_scaling=0.0) 
+    loss = weighted_diff.pow(2).sum(dim=[1,2,3])
+    return loss.mean()
+
+def ANILoss_gh_energy_dotgogsqogp1(edmnet, images, labels, g_fn, h_fn, T, tmin=1e-9):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns per-pixel squared error tensor (identical convention as EDMLoss)
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g, dot_g = g_fn.g_and_grad(t_vec)
+    h, dot_h = h_fn.g_and_grad(t_vec)
+    g = g
+    h = h
+    dot_g = dot_g
+    dot_h = dot_h
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)        #eps ~ N(0,I)
+    x_noisy = images + mat_mul((g,h), edmnet.V, eps, power=0.5, identity_scaling=0.0)
+    den = edmnet(x_noisy, (g,h), class_labels=labels)
+    diff = den - images     # model residual
+    sigma_data = 1
+    #this line updated
+    weighted_diff = mat_mul(((dot_g)/(g**2)/(g+sigma_data**2),(dot_h)/(h**2)/(h+sigma_data**2)), edmnet.V, diff, power=0.5, identity_scaling=0.0) 
+    loss = weighted_diff.pow(2).sum(dim=[1,2,3])
+    return loss.mean()
+
+def ANILoss_gh_energy_dotgogsq(edmnet, images, labels, g_fn, h_fn, T, tmin=1e-9):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns per-pixel squared error tensor (identical convention as EDMLoss)
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g, dot_g = g_fn.g_and_grad(t_vec)
+    h, dot_h = h_fn.g_and_grad(t_vec)
+    g = g
+    h = h
+    dot_g = dot_g
+    dot_h = dot_h
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)        #eps ~ N(0,I)
+    x_noisy = images + mat_mul((g,h), edmnet.V, eps, power=0.5, identity_scaling=0.0)
+    den = edmnet(x_noisy, (g,h), class_labels=labels)
+    diff = den - images     # model residual
+    #this line updated
+    weighted_diff = mat_mul(((dot_g)/(g**2),(dot_h)/(h**2)), edmnet.V, diff, power=0.5, identity_scaling=0.0) 
+    loss = weighted_diff.pow(2).sum(dim=[1,2,3])
+    return loss.mean()
+
+def ANILoss_gh_energy_dotgogogp1(edmnet, images, labels, g_fn, h_fn, T, tmin=1e-9):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns per-pixel squared error tensor (identical convention as EDMLoss)
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g, dot_g = g_fn.g_and_grad(t_vec)
+    h, dot_h = h_fn.g_and_grad(t_vec)
+    g = g
+    h = h
+    dot_g = dot_g
+    dot_h = dot_h
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)        #eps ~ N(0,I)
+    x_noisy = images + mat_mul((g,h), edmnet.V, eps, power=0.5, identity_scaling=0.0)
+    den = edmnet(x_noisy, (g,h), class_labels=labels)
+    diff = den - images     # model residual
+    sigma_data = 1
+    #this line updated
+    weighted_diff = mat_mul(((dot_g)/(g)/(g+sigma_data**2),(dot_h)/(h)/(h+sigma_data**2)), edmnet.V, diff, power=0.5, identity_scaling=0.0) 
+    loss = weighted_diff.pow(2).sum(dim=[1,2,3])
+    return loss.mean()
+
+def ANILoss_gh_energy_dotgog(edmnet, images, labels, g_fn, h_fn, T, tmin=1e-9):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns per-pixel squared error tensor (identical convention as EDMLoss)
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g, dot_g = g_fn.g_and_grad(t_vec)
+    h, dot_h = h_fn.g_and_grad(t_vec)
+    g = g
+    h = h
+    dot_g = dot_g
+    dot_h = dot_h
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)        #eps ~ N(0,I)
+    x_noisy = images + mat_mul((g,h), edmnet.V, eps, power=0.5, identity_scaling=0.0)
+    den = edmnet(x_noisy, (g,h), class_labels=labels)
+    diff = den - images     # model residual
+    #this line updated
+    weighted_diff = mat_mul(((dot_g)/(g),(dot_h)/(h)), edmnet.V, diff, power=0.5, identity_scaling=0.0) 
+    loss = weighted_diff.pow(2).sum(dim=[1,2,3])
+    return loss.mean()
+
+def ANILoss_gh_energy_plus_discretization_K_step(edmnet, images, labels, g_fn, h_fn, T, tmin=1e-9, K=8):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns per-pixel squared error tensor (identical convention as EDMLoss)
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g, dot_g = g_fn.g_and_grad(t_vec)
+    h, dot_h = h_fn.g_and_grad(t_vec)
+
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)        #eps ~ N(0,I)
+    x_noisy = images + mat_mul((g,h), edmnet.V, eps, power=0.5, identity_scaling=0.0)
+    
+    #####################
+    ### compute detached score
+    #####################
+    detached = {k: v.detach() for k,v in edmnet.named_parameters()}
+    M_times_score_detached = functional_call(edmnet, detached, (x_noisy, (g, h)),
+                         {"class_labels": labels}) - x_noisy
+    
+    #####################
+    ### dotgsqogsqogp1: loss wrt true score  (3.1 FID)
+    #####################
+    scaled_net_score = mat_mul((dot_g/(g)/((g+0.5)**0.5),dot_h/(h)/((h+0.5)**0.5)), edmnet.V, M_times_score_detached) 
+    scaled_true_noisy_score = mat_mul((dot_g/(g)/((g+0.5)**0.5),dot_h/(h)/((h+0.5)**0.5)), edmnet.V, images-x_noisy) 
+
+    loss = (scaled_true_noisy_score - scaled_net_score).pow(2).sum(dim=[1,2,3]).mean() 
+
+    loss = loss - (scaled_true_noisy_score).pow(2).sum(dim=[1,2,3]).mean() + (scaled_net_score).pow(2).sum(dim=[1,2,3]).mean()
+
+    loss = loss
+
+    #####################
+    ### loss wrt discretization
+    #####################
+    eval_times = torch.linspace(0.0, T, K, device=device)
+    idx = torch.randint(1, eval_times.numel(), (B,), device=device)
+    t_vec = eval_times[idx]
+    t_vec_target = eval_times[idx-1]
+    t_vec_next = t_vec + 0.5 * (t_vec_target - t_vec)
+
+    print(f'eval_times: {eval_times}') #delete after checking
+    print(f't_vec: {t_vec}') #delete after checking
+    print(f't_vec_target: {t_vec_target}') #delete after checking
+    print(f't_vec_next: {t_vec_next}') #delete after checking
+    assert False
+
+    g_next, _ = g_fn.g_and_grad(t_vec_next)
+    h_next, _ = h_fn.g_and_grad(t_vec_next)
+
+    t_rand_mid = t_vec + torch.rand(t_vec.shape,device=device) * (t_vec_target - t_vec) 
+    g_rand_mid, dotg_rand_mid = g_fn.g_and_grad(t_rand_mid)
+    h_rand_mid, doth_rand_mid = h_fn.g_and_grad(t_rand_mid)
+    
+    #g_next = (g.sqrt()-(dot_g/g.sqrt() *delta))**2
+    #h_next = (h.sqrt()-(dot_h/h.sqrt() *delta))**2
+    
+    # compute update direction
+    flow_dir = mat_mul((g, h), edmnet.V, M_times_score_detached, power = -0.5)
+    x_next = x_noisy + mat_mul((g_next.sqrt() - g.sqrt(), h_next.sqrt() - h.sqrt()), 
+                      edmnet.V, -flow_dir, power = 1.0)
+    M_times_score_next_detached = functional_call(edmnet, detached, (x_next, (g_next, h_next)),
+                         {"class_labels": labels}) - x_next
+    flow_dir_next = mat_mul((g_next, h_next), edmnet.V, M_times_score_next_detached, power = -0.5)
+
+    # estimate d/ds flow
+    dt_flow_dir = mat_mul((1/(g_next.sqrt()-g.sqrt()),1/(h_next.sqrt()-h.sqrt())), edmnet.V, 0.5 * (flow_dir_next - flow_dir)) 
+
+    #disc_err = mat_mul(((dot_g)/(g**0.5)/((g+1)**0.5),(dot_h)/(h**0.5)/((h+1)**0.5)), edmnet.V, (flow_dir - flow_dir_next)) 
+
+    displacement_at_t_mid = (mat_mul((g_rand_mid.sqrt()-g.sqrt(),h_rand_mid.sqrt()-h.sqrt()), edmnet.V, - flow_dir) 
+                     + mat_mul(((g_rand_mid.sqrt()-g.sqrt())**2,(h_rand_mid.sqrt()-h.sqrt())**2), edmnet.V, - 0.5 * dt_flow_dir))
+    x_rand_mid = x_noisy + displacement_at_t_mid
+    
+    velocity_at_t_mid = mat_mul((dotg_rand_mid/(g_rand_mid**0.5),doth_rand_mid/(h_rand_mid**0.5)), edmnet.V, 
+                     - flow_dir + mat_mul(((g_rand_mid.sqrt()-g.sqrt()),(h_rand_mid.sqrt()-h.sqrt())), edmnet.V, - dt_flow_dir))
+
+    M_times_score_rand_mid = functional_call(edmnet, detached, (x_rand_mid, (g_rand_mid, h_rand_mid)),
+                         {"class_labels": labels}) - x_rand_mid
+    
+    true_velocity_at_t_mid = mat_mul((dotg_rand_mid/g_rand_mid,doth_rand_mid/h_rand_mid), edmnet.V, - M_times_score_rand_mid) 
+
+    disc_err = mat_mul((1/(g_rand_mid+0.5)**0.5,1/(h_rand_mid+0.5)**0.5), edmnet.V, velocity_at_t_mid - true_velocity_at_t_mid)
+    
+    loss = loss + disc_err.norm(p=2,dim=[1,2,3]).pow(2).mean()
+    return loss
+
+
+
+def M_EDM_ode_K_test(net, latents, t_vec, g_fn, h_fn, labels):
+    g, _ = g_fn.g_and_grad(t_vec)
+    h, _ = h_fn.g_and_grad(t_vec)
+    
+    #optional
+    g = torch.cat([torch.zeros(1,device=g.device), g])
+    h = torch.cat([torch.zeros(1,device=h.device), h])
+    g = g.detach()
+    h = h.detach()
+
+
+    ### OPTION 1: average in t space
+    t_vec = torch.cat([torch.zeros(1,device=g.device), t_vec])
+    t_half = (t_vec[1:]+t_vec[:-1])/2
+    
+    print('sampling t_vec:', t_vec)
+    print('sampling t_half:', t_half)
+
+    assert False
+
+def ANILoss_gh_energy_plus_discretization_K_step_with_random_tvec(edmnet, images, labels, g_fn, h_fn, T, tmin=1e-9, K=8):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns per-pixel squared error tensor (identical convention as EDMLoss)
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g, dot_g = g_fn.g_and_grad(t_vec)
+    h, dot_h = h_fn.g_and_grad(t_vec)
+
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)        #eps ~ N(0,I)
+    x_noisy = images + mat_mul((g,h), edmnet.V, eps, power=0.5, identity_scaling=0.0)
+    
+    #####################
+    ### compute detached score
+    #####################
+    detached = {k: v.detach() for k,v in edmnet.named_parameters()}
+    M_times_score_detached = functional_call(edmnet, detached, (x_noisy, (g, h)),
+                         {"class_labels": labels}) - x_noisy
+    
+    #####################
+    ### dotgsqogsqogp1: loss wrt true score  (3.1 FID)
+    #####################
+    scaled_net_score = mat_mul((dot_g/(g)/((g+0.5)**0.5),dot_h/(h)/((h+0.5)**0.5)), edmnet.V, M_times_score_detached) 
+    scaled_true_noisy_score = mat_mul((dot_g/(g)/((g+0.5)**0.5),dot_h/(h)/((h+0.5)**0.5)), edmnet.V, images-x_noisy) 
+
+    loss = (scaled_true_noisy_score - scaled_net_score).pow(2).sum(dim=[1,2,3]).mean() 
+
+    loss = loss - (scaled_true_noisy_score).pow(2).sum(dim=[1,2,3]).mean() + (scaled_net_score).pow(2).sum(dim=[1,2,3]).mean()
+
+    loss = loss
+
+    #####################
+    ### loss wrt discretization
+    #####################
+    interval = 6400.0/K
+    t_vec_target = torch.clamp(t_vec - interval, min=1e-9, max=6400)
+    t_vec_next = t_vec + 0.5 * (t_vec_target - t_vec)
+
+    g_next, _ = g_fn.g_and_grad(t_vec_next)
+    h_next, _ = h_fn.g_and_grad(t_vec_next)
+
+    t_rand_mid = t_vec + torch.rand(t_vec.shape,device=device) * (t_vec_target - t_vec) 
+    g_rand_mid, dotg_rand_mid = g_fn.g_and_grad(t_rand_mid)
+    h_rand_mid, doth_rand_mid = h_fn.g_and_grad(t_rand_mid)
+    
+    #g_next = (g.sqrt()-(dot_g/g.sqrt() *delta))**2
+    #h_next = (h.sqrt()-(dot_h/h.sqrt() *delta))**2
+    
+    # compute update direction
+    flow_dir = mat_mul((g, h), edmnet.V, M_times_score_detached, power = -0.5)
+    x_next = x_noisy + mat_mul((g_next.sqrt() - g.sqrt(), h_next.sqrt() - h.sqrt()), 
+                      edmnet.V, -flow_dir, power = 1.0)
+    M_times_score_next_detached = functional_call(edmnet, detached, (x_next, (g_next, h_next)),
+                         {"class_labels": labels}) - x_next
+    flow_dir_next = mat_mul((g_next, h_next), edmnet.V, M_times_score_next_detached, power = -0.5)
+
+    # estimate d/ds flow
+    dt_flow_dir = mat_mul((1/(g_next.sqrt()-g.sqrt()),1/(h_next.sqrt()-h.sqrt())), edmnet.V, 0.5 * (flow_dir_next - flow_dir)) 
+
+    #disc_err = mat_mul(((dot_g)/(g**0.5)/((g+1)**0.5),(dot_h)/(h**0.5)/((h+1)**0.5)), edmnet.V, (flow_dir - flow_dir_next)) 
+
+    displacement_at_t_mid = (mat_mul((g_rand_mid.sqrt()-g.sqrt(),h_rand_mid.sqrt()-h.sqrt()), edmnet.V, - flow_dir) 
+                     + mat_mul(((g_rand_mid.sqrt()-g.sqrt())**2,(h_rand_mid.sqrt()-h.sqrt())**2), edmnet.V, - 0.5 * dt_flow_dir))
+    x_rand_mid = x_noisy + displacement_at_t_mid
+    
+    velocity_at_t_mid = mat_mul((dotg_rand_mid/(g_rand_mid**0.5),doth_rand_mid/(h_rand_mid**0.5)), edmnet.V, 
+                     - flow_dir + mat_mul(((g_rand_mid.sqrt()-g.sqrt()),(h_rand_mid.sqrt()-h.sqrt())), edmnet.V, - dt_flow_dir))
+
+    M_times_score_rand_mid = functional_call(edmnet, detached, (x_rand_mid, (g_rand_mid, h_rand_mid)),
+                         {"class_labels": labels}) - x_rand_mid
+    
+    true_velocity_at_t_mid = mat_mul((dotg_rand_mid/g_rand_mid,doth_rand_mid/h_rand_mid), edmnet.V, - M_times_score_rand_mid) 
+
+    disc_err = mat_mul((1/(g_rand_mid+0.5)**0.5,1/(h_rand_mid+0.5)**0.5), edmnet.V, velocity_at_t_mid - true_velocity_at_t_mid)
+    
+    loss = loss + disc_err.norm(p=2,dim=[1,2,3]).pow(2).mean()
+    return loss
+
+
+def ANILoss_gh_energy_plus_discretization_K_step_with_random_interval(edmnet, images, labels, g_fn, h_fn, T, tmin=1e-9, K=8):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns per-pixel squared error tensor (identical convention as EDMLoss)
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g, dot_g = g_fn.g_and_grad(t_vec)
+    h, dot_h = h_fn.g_and_grad(t_vec)
+
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)        #eps ~ N(0,I)
+    x_noisy = images + mat_mul((g,h), edmnet.V, eps, power=0.5, identity_scaling=0.0)
+    
+    #####################
+    ### compute detached score
+    #####################
+    detached = {k: v.detach() for k,v in edmnet.named_parameters()}
+    M_times_score_detached = functional_call(edmnet, detached, (x_noisy, (g, h)),
+                         {"class_labels": labels}) - x_noisy
+    
+    #####################
+    ### dotgsqogsqogp1: loss wrt true score  (3.1 FID)
+    #####################
+    scaled_net_score = mat_mul((dot_g/(g)/((g+0.5)**0.5),dot_h/(h)/((h+0.5)**0.5)), edmnet.V, M_times_score_detached) 
+    scaled_true_noisy_score = mat_mul((dot_g/(g)/((g+0.5)**0.5),dot_h/(h)/((h+0.5)**0.5)), edmnet.V, images-x_noisy) 
+
+    loss = (scaled_true_noisy_score - scaled_net_score).pow(2).sum(dim=[1,2,3]).mean() 
+
+    loss = loss - (scaled_true_noisy_score).pow(2).sum(dim=[1,2,3]).mean() + (scaled_net_score).pow(2).sum(dim=[1,2,3]).mean()
+
+    loss = loss
+
+    #####################
+    ### loss wrt discretization
+    #####################
+    eval_times = torch.linspace(0.0, T, K, device=device)
+    idx = torch.randint(1, eval_times.numel(), (B,), device=device)
+    t_vec = eval_times[idx]
+    #t_vec_target = eval_times[idx-1]
+    interval = 6400.0/K
+    delta = (torch.rand(t_vec.shape,device=device)) * interval
+    t_vec_target = torch.clamp(t_vec - delta, min=1e-9, max=6400)
+
+    t_vec_next = t_vec + 0.5 * (t_vec_target - t_vec)
+
+    print(f'eval_times: {eval_times}') #delete after checking
+    print(f't_vec: {t_vec[0:10]}') #delete after checking
+    print(f't_vec_target: {t_vec_target[0:10]}') #delete after checking
+    print(f't_vec_next: {t_vec_next[0:10]}') #delete after checking
+    assert False
+
+    g_next, _ = g_fn.g_and_grad(t_vec_next)
+    h_next, _ = h_fn.g_and_grad(t_vec_next)
+
+    t_rand_mid = t_vec + torch.rand(t_vec.shape,device=device) * (t_vec_target - t_vec) 
+    g_rand_mid, dotg_rand_mid = g_fn.g_and_grad(t_rand_mid)
+    h_rand_mid, doth_rand_mid = h_fn.g_and_grad(t_rand_mid)
+    
+    #g_next = (g.sqrt()-(dot_g/g.sqrt() *delta))**2
+    #h_next = (h.sqrt()-(dot_h/h.sqrt() *delta))**2
+    
+    # compute update direction
+    flow_dir = mat_mul((g, h), edmnet.V, M_times_score_detached, power = -0.5)
+    x_next = x_noisy + mat_mul((g_next.sqrt() - g.sqrt(), h_next.sqrt() - h.sqrt()), 
+                      edmnet.V, -flow_dir, power = 1.0)
+    M_times_score_next_detached = functional_call(edmnet, detached, (x_next, (g_next, h_next)),
+                         {"class_labels": labels}) - x_next
+    flow_dir_next = mat_mul((g_next, h_next), edmnet.V, M_times_score_next_detached, power = -0.5)
+
+    # estimate d/ds flow
+    dt_flow_dir = mat_mul((1/(g_next.sqrt()-g.sqrt()),1/(h_next.sqrt()-h.sqrt())), edmnet.V, 0.5 * (flow_dir_next - flow_dir)) 
+
+    #disc_err = mat_mul(((dot_g)/(g**0.5)/((g+1)**0.5),(dot_h)/(h**0.5)/((h+1)**0.5)), edmnet.V, (flow_dir - flow_dir_next)) 
+
+    displacement_at_t_mid = (mat_mul((g_rand_mid.sqrt()-g.sqrt(),h_rand_mid.sqrt()-h.sqrt()), edmnet.V, - flow_dir) 
+                     + mat_mul(((g_rand_mid.sqrt()-g.sqrt())**2,(h_rand_mid.sqrt()-h.sqrt())**2), edmnet.V, - 0.5 * dt_flow_dir))
+    x_rand_mid = x_noisy + displacement_at_t_mid
+    
+    velocity_at_t_mid = mat_mul((dotg_rand_mid/(g_rand_mid**0.5),doth_rand_mid/(h_rand_mid**0.5)), edmnet.V, 
+                     - flow_dir + mat_mul(((g_rand_mid.sqrt()-g.sqrt()),(h_rand_mid.sqrt()-h.sqrt())), edmnet.V, - dt_flow_dir))
+
+    M_times_score_rand_mid = functional_call(edmnet, detached, (x_rand_mid, (g_rand_mid, h_rand_mid)),
+                         {"class_labels": labels}) - x_rand_mid
+    
+    true_velocity_at_t_mid = mat_mul((dotg_rand_mid/g_rand_mid,doth_rand_mid/h_rand_mid), edmnet.V, - M_times_score_rand_mid) 
+
+    disc_err = mat_mul((1/(g_rand_mid+0.5)**0.5,1/(h_rand_mid+0.5)**0.5), edmnet.V, velocity_at_t_mid - true_velocity_at_t_mid)
+    
+    loss = loss + disc_err.norm(p=2,dim=[1,2,3]).pow(2).mean()
+    return loss
+
+
+def ANILoss_gh_energy_plus_discretization_midend(edmnet, images, labels, g_fn, h_fn, mid_fn, T, tmin=1e-9, disc_mult=1.0):
+    """
+    images : [B,C,W,W]  in [-1,1]
+    returns per-pixel squared error tensor (identical convention as EDMLoss)
+    """
+    B, _, _, _ = images.shape
+    device = images.device
+
+    t_vec = torch.rand(B,device=device)*(T-tmin)+tmin
+    g, dot_g = g_fn.g_and_grad(t_vec)
+    h, dot_h = h_fn.g_and_grad(t_vec)
+
+    if labels is not None:
+        labels = labels.detach()
+    eps = torch.randn_like(images)        #eps ~ N(0,I)
+    x_noisy = images + mat_mul((g,h), edmnet.V, eps, power=0.5, identity_scaling=0.0)
+    
+    #####################
+    ### compute detached score
+    #####################
+    detached = {k: v.detach() for k,v in edmnet.named_parameters()}
+    M_times_score_detached = functional_call(edmnet, detached, (x_noisy, (g, h)),
+                         {"class_labels": labels}) - x_noisy
+    
+    #####################
+    ### dotgsqogsqogp1: loss wrt true score  (3.1 FID)
+    #####################
+    scaled_net_score = mat_mul((dot_g/(g)/((g+0.5)**0.5),dot_h/(h)/((h+0.5)**0.5)), edmnet.V, M_times_score_detached) 
+    scaled_true_noisy_score = mat_mul((dot_g/(g)/((g+0.5)**0.5),dot_h/(h)/((h+0.5)**0.5)), edmnet.V, images-x_noisy) 
+
+    loss = (scaled_true_noisy_score - scaled_net_score).pow(2).sum(dim=[1,2,3]).mean() 
+
+    loss = loss - (scaled_true_noisy_score).pow(2).sum(dim=[1,2,3]).mean() + (scaled_net_score).pow(2).sum(dim=[1,2,3]).mean()
+
+    loss = loss
+
+    #####################
+    ### loss wrt discretization
+    #####################
+    interval = 6400.0/8
+    delta = (torch.rand(t_vec.shape,device=device)) * interval
+    #delta = (torch.rand(t_vec.shape,device=device)*0.5+0.5) * interval
+    t_vec_target = torch.clamp(t_vec - delta, min=1e-9, max=6400)
+
+    mid_cur, _ = mid_fn.g_and_grad(t_vec)
+
+    t_vec_next = t_vec + mid_cur.detach() * (t_vec_target - t_vec)
+    
+    g_next, dot_g_next = g_fn.g_and_grad(t_vec_next)
+    h_next, dot_h_next = h_fn.g_and_grad(t_vec_next)
+
+    g_next = g_next + dot_g_next.detach() * (mid_cur * (t_vec_target - t_vec)-(mid_cur * (t_vec_target - t_vec)).detach())
+    h_next = g_next + dot_h_next.detach() * (mid_cur * (t_vec_target - t_vec)-(mid_cur * (t_vec_target - t_vec)).detach())
+
+    t_rand_mid = t_vec + torch.rand(t_vec.shape,device=device) * (t_vec_target - t_vec) 
+    g_rand_mid, dotg_rand_mid = g_fn.g_and_grad(t_rand_mid)
+    h_rand_mid, doth_rand_mid = h_fn.g_and_grad(t_rand_mid)
+    
+    #g_next = (g.sqrt()-(dot_g/g.sqrt() *delta))**2
+    #h_next = (h.sqrt()-(dot_h/h.sqrt() *delta))**2
+    
+    # compute update direction
+    flow_dir = mat_mul((g, h), edmnet.V, M_times_score_detached, power = -0.5)
+    x_next = x_noisy + mat_mul((g_next.sqrt() - g.sqrt(), h_next.sqrt() - h.sqrt()), 
+                      edmnet.V, -flow_dir, power = 1.0)
+    M_times_score_next_detached = functional_call(edmnet, detached, (x_next, (g_next, h_next)),
+                         {"class_labels": labels}) - x_next
+    flow_dir_next = mat_mul((g_next, h_next), edmnet.V, M_times_score_next_detached, power = -0.5)
+
+    # estimate d/ds flow
+    dt_flow_dir = mat_mul((1/(g_next.sqrt()-g.sqrt()),1/(h_next.sqrt()-h.sqrt())), edmnet.V, (flow_dir_next - flow_dir)) 
+    displacement_at_t_mid = (mat_mul((g_rand_mid.sqrt()-g.sqrt(),h_rand_mid.sqrt()-h.sqrt()), edmnet.V, - flow_dir) 
+                     + mat_mul(((g_rand_mid.sqrt()-g.sqrt())**2,(h_rand_mid.sqrt()-h.sqrt())**2), edmnet.V, - 0.5 * dt_flow_dir))
+    x_rand_mid = x_noisy + displacement_at_t_mid
+    
+    velocity_at_t_mid = mat_mul((dotg_rand_mid/(g_rand_mid**0.5),doth_rand_mid/(h_rand_mid**0.5)), edmnet.V, 
+                     - flow_dir + mat_mul(((g_rand_mid.sqrt()-g.sqrt()),(h_rand_mid.sqrt()-h.sqrt())), edmnet.V, - dt_flow_dir))
+
+    M_times_score_rand_mid = functional_call(edmnet, detached, (x_rand_mid, (g_rand_mid, h_rand_mid)),
+                         {"class_labels": labels}) - x_rand_mid
+    
+    true_velocity_at_t_mid = mat_mul((dotg_rand_mid/g_rand_mid,doth_rand_mid/h_rand_mid), edmnet.V, - M_times_score_rand_mid) 
+
+    disc_err = mat_mul((1/(g_rand_mid+0.5)**0.5,1/(h_rand_mid+0.5)**0.5), edmnet.V, velocity_at_t_mid - true_velocity_at_t_mid)
+    
+    loss = loss + disc_err.norm(p=2,dim=[1,2,3]).pow(2).mean()
+    return loss
+
+# class GFnBoundedLinear(nn.Module):
+#     """
+#     Scalar schedule g(t): [0, T] -> (g_min, g_max)
+#     - K knot values, linearly interpolated in arithmetic space
+#     - NO monotonicity constraint
+#     - Endpoints g(0) and g(T) are learnable (not fixed)
+#     - forward(t) returns (g(t), g'(t)) with autograd support to knot logits
+
+#     Note:
+#       - g'(t) is piecewise-constant (slope within each interval).
+#       - At knot locations, derivative is ambiguous; this returns the *left* interval's slope
+#         because searchsorted(..., right=False) selects the interval to the left.
+#     """
+
+#     def __init__(
+#         self,
+#         K: int,
+#         T=6400.0,
+#         times: Optional[torch.Tensor] = None,
+#         init_g: Optional[torch.Tensor] = None,
+#         g_min: float = 0.5,
+#         g_max: float = 1.0,
+#         clamp_t: bool = True,
+#         device = torch.device('cuda'),
+#         dtype = torch.float32,
+#     ):
+#         super().__init__()
+#         if K < 2:
+#             raise ValueError("K must be >= 2.")
+#         if not (g_min < g_max):
+#             raise ValueError("Require g_min < g_max.")
+
+#         self.T = float(T)
+#         self.K = int(K)
+#         self.g_min = float(g_min)
+#         self.g_max = float(g_max)
+#         self.clamp_t = bool(clamp_t)
+
+#         # Knot times
+#         if times is None:
+#             times = torch.linspace(0.0, self.T, self.K, device=device, dtype=dtype)
+#         else:
+#             times = times.to(device=device, dtype=dtype)
+#             if times.ndim != 1 or times.numel() != self.K:
+#                 raise ValueError(f"times must have shape ({self.K},).")
+#             if not torch.all(times[1:] > times[:-1]):
+#                 raise ValueError("times must be strictly increasing.")
+#             if not torch.isclose(times[0], torch.tensor(0.0, device=times.device, dtype=times.dtype), atol=1e-6):
+#                 raise ValueError("times[0] must be 0.0.")
+#             if not torch.isclose(times[-1], torch.tensor(self.T, device=times.device, dtype=times.dtype), atol=1e-6):
+#                 raise ValueError("times[-1] must be T.")
+
+#         self.register_buffer("times", times.clone())
+
+#         # Init knot values (in g-space), then convert to logits
+#         if init_g is None:
+#             init_g = torch.ones_like(times) * 0.7
+#         else:
+#             init_g = init_g.to(device=times.device, dtype=times.dtype)
+#             if init_g.shape != (self.K,):
+#                 raise ValueError(f"init_g must have shape ({self.K},).")
+#             if not torch.all((init_g > self.g_min) & (init_g < self.g_max)):
+#                 raise ValueError(f"init_g must lie strictly in ({self.g_min}, {self.g_max}).")
+
+#         # g -> u in (0,1) -> logits
+#         u = (init_g - self.g_min) / (self.g_max - self.g_min)
+#         logits_init = torch.log(u) - torch.log1p(-u)
+
+#         self.logits = nn.Parameter(logits_init.detach().clone())
+
+#     def knots(self) -> torch.Tensor:
+#         """Return knot values g(t_i), shape (K,)."""
+#         # Keep away from exact endpoints to avoid saturating exactly at bounds
+#         s = torch.sigmoid(self.logits)
+#         return self.g_min + (self.g_max - self.g_min) * s
+
+#     def _interp(self, t: torch.Tensor):
+#         # Cast for searchsorted compatibility
+#         t_flat = t.reshape(-1).to(device=self.times.device, dtype=self.times.dtype)
+
+#         gk = self.knots()  # (K,)
+
+#         # Interval index: 1..K-1
+#         idx = torch.searchsorted(self.times, t_flat, right=False).clamp(1, self.K - 1)
+
+#         t0, t1 = self.times[idx - 1], self.times[idx]
+#         g0, g1 = gk[idx - 1], gk[idx]
+
+#         w = (t_flat - t0) / (t1 - t0)          # (N,)
+#         g = g0 + w * (g1 - g0)                 # (N,)
+#         g_dot = (g1 - g0) / (t1 - t0)          # (N,) piecewise-constant slope
+
+#         return g.view_as(t), g_dot.view_as(t)
+
+#     def forward(self, t: torch.Tensor):
+#         return self._interp(t)
+
+#     def g_and_grad(self, t: torch.Tensor):
+#         return self._interp(t)
+
+class GFnBoundedLinear(nn.Module):
+    """
+    Scalar schedule g(t): [0, T] -> [g_min + u_eps, g_max - u_eps]
+    - K knot values, linearly interpolated in arithmetic space
+    - NO monotonicity constraint
+    - Endpoints g(0) and g(T) are learnable (not fixed)
+    - forward(t) returns (g(t), g'(t)) with autograd support to knot logits
+    """
+
+    def __init__(
+        self,
+        K: int,
+        T: float = 6400.0,
+        times: Optional[torch.Tensor] = None,
+        init_g: Optional[torch.Tensor] = None,
+        g_min: float = 0.5,
+        g_max: float = 1.0,
+        u_eps: float = 1e-4,          # <-- NEW: absolute margin in g-space
+        clamp_t: bool = True,
+        device=torch.device("cuda"),
+        dtype=torch.float32,
+        logit_eps: float = 1e-6,      # for safe logit init only
+    ):
+        super().__init__()
+        if K < 2:
+            raise ValueError("K must be >= 2.")
+        if not (g_min < g_max):
+            raise ValueError("Require g_min < g_max.")
+        if u_eps < 0:
+            raise ValueError("u_eps must be >= 0.")
+
+        self.T = float(T)
+        self.K = int(K)
+        self.g_min = float(g_min)
+        self.g_max = float(g_max)
+        self.u_eps = float(u_eps)
+        self.clamp_t = bool(clamp_t)
+
+        # Effective (achievable) bounds
+        self.g_lo = self.g_min + self.u_eps
+        self.g_hi = self.g_max - self.u_eps
+        if not (self.g_lo < self.g_hi):
+            raise ValueError(
+                f"Need g_min + u_eps < g_max - u_eps, got "
+                f"{self.g_lo} !< {self.g_hi}. Reduce u_eps."
+            )
+
+        # Knot times
+        if times is None:
+            times = torch.linspace(0.0, self.T, self.K, device=device, dtype=dtype)
+        else:
+            times = times.to(device=device, dtype=dtype)
+            if times.ndim != 1 or times.numel() != self.K:
+                raise ValueError(f"times must have shape ({self.K},).")
+            if not torch.all(times[1:] > times[:-1]):
+                raise ValueError("times must be strictly increasing.")
+            if not torch.isclose(times[0], torch.tensor(0.0, device=times.device, dtype=times.dtype), atol=1e-6):
+                raise ValueError("times[0] must be 0.0.")
+            if not torch.isclose(times[-1], torch.tensor(self.T, device=times.device, dtype=times.dtype), atol=1e-6):
+                raise ValueError("times[-1] must be T.")
+
+        self.register_buffer("times", times.clone())
+
+        # Init knot values (in g-space), then convert to logits
+        if init_g is None:
+            # pick something safely inside achievable range
+            init_g = torch.full_like(times, (self.g_lo + self.g_hi) / 2.0)
+        else:
+            init_g = init_g.to(device=times.device, dtype=times.dtype)
+            if init_g.shape != (self.K,):
+                raise ValueError(f"init_g must have shape ({self.K},).")
+            # IMPORTANT: enforce the achievable bounds, not (g_min, g_max)
+            if not torch.all((init_g >= self.g_lo) & (init_g <= self.g_hi)):
+                raise ValueError(f"init_g must lie in [{self.g_lo}, {self.g_hi}].")
+
+        # Map init_g -> u in (0,1) for (g_lo, g_hi), then logits
+        u = (init_g - self.g_lo) / (self.g_hi - self.g_lo)
+        u = u.clamp(min=logit_eps, max=1.0 - logit_eps)  # safe logit init
+
+        logits_init = torch.log(u) - torch.log1p(-u)
+        self.logits = nn.Parameter(logits_init.detach().clone())
+
+    def knots(self) -> torch.Tensor:
+        """Return knot values g(t_i), shape (K,), guaranteed in [g_lo, g_hi]."""
+        s = torch.sigmoid(self.logits)
+        # Use achievable range [g_lo, g_hi]
+        return self.g_lo + (self.g_hi - self.g_lo) * s
+
+    def _interp(self, t: torch.Tensor):
+        if self.clamp_t:
+            t = t.clamp(0.0, self.T)
+
+        # Cast for searchsorted compatibility
+        t_flat = t.reshape(-1).to(device=self.times.device, dtype=self.times.dtype)
+
+        gk = self.knots()  # (K,)
+
+        # Interval index: 1..K-1
+        idx = torch.searchsorted(self.times, t_flat, right=False).clamp(1, self.K - 1)
+
+        t0, t1 = self.times[idx - 1], self.times[idx]
+        g0, g1 = gk[idx - 1], gk[idx]
+
+        w = (t_flat - t0) / (t1 - t0)          # (N,)
+        g = g0 + w * (g1 - g0)                 # (N,)
+        g_dot = (g1 - g0) / (t1 - t0)          # (N,)
+
+        return g.view_as(t), g_dot.view_as(t)
+
+    def forward(self, t: torch.Tensor):
+        return self._interp(t)
+
+    def g_and_grad(self, t: torch.Tensor):
+        return self._interp(t)
+        
+def edm_flow_sampler_midend(
+    flow_net, latents, class_labels=None, num_steps=18, rho=7, g_fn=None, h_fn=None, f_fn=None, mid_fn=None,
+    return_all=False
+):
+    """
+    Returns:
+      x_final: [B,C,H,W]
+      xs:      [S,B,C,H,W] where S = num_steps+1 (includes initial x at t_steps[0])
+    """
+    sigma_min = 0.002
+    sigma_max = 80
+
+    step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
+    sigma_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) *
+                  (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
+
+    # Convert sigma^2 to "time" via f(t)^2 = sigma^2 (your note: f = sqrt(g*h))
+    #t_steps = invert_g_bisect(f_fn, sigma_steps**2, max_iter=32)
+
+    t_steps = torch.linspace(0.0, 6400.0, num_steps, device=latents.device).flip(0)
+    t_steps = torch.cat([t_steps, torch.zeros_like(t_steps[:1])])  # t_N = 0
+
+    x_next = latents.to(torch.float64) * t_steps[0].sqrt()
+    dct_V = flow_net.V  # expected to be on device already
+    xs = []
+
+    for i, (t_hat, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):  # 0..N-1
+        x_hat = x_next
+
+        g_hat = g_fn(t_hat)[0] * torch.ones_like(latents[:, 0, 0, 0])
+        h_hat = h_fn(t_hat)[0] * torch.ones_like(latents[:, 0, 0, 0])
+        g_next = g_fn(t_next)[0] * torch.ones_like(latents[:, 0, 0, 0])
+        h_next = h_fn(t_next)[0] * torch.ones_like(latents[:, 0, 0, 0])
+
+        mid_hat = mid_fn(t_hat)[0] * torch.ones_like(latents[:, 0, 0, 0])
+        g_eval = g_hat + mid_hat * (g_next - g_hat)
+        h_eval = h_hat + mid_hat * (h_next - h_hat)
+
+        # Euler
+        #flow_hat = flow_net(x_hat, (g_hat, h_hat), class_labels)
+        # replace with manual conversion:
+        x0 = flow_net(x_hat, (g_hat, h_hat), class_labels)
+        flow_hat = mat_mul(
+            (1/g_hat.sqrt().to(torch.float32), 1/h_hat.sqrt().to(torch.float32)), dct_V, (x0 - x_hat).to(torch.float32)
+        ) 
+
+        x_eval = x_hat + mat_mul(
+            (g_eval.sqrt() - g_hat.sqrt(), h_eval.sqrt() - h_hat.sqrt()),
+            dct_V,
+            -flow_hat
+        )
+
+        # Heun (except last)
+        if i < num_steps - 1:
+            #flow_prime = flow_net(x_next, (g_next, h_next), class_labels)
+            xprime = flow_net(x_eval, (g_eval, h_eval), class_labels)
+            flow_prime = mat_mul(
+                (1/g_eval.sqrt().to(torch.float32), 1/h_eval.sqrt().to(torch.float32)), dct_V, (xprime - x_next).to(torch.float32)
+            ) 
+
+            ratio_g = (g_next.sqrt() - g_hat.sqrt())/(g_eval.sqrt() - g_hat.sqrt())
+            ratio_h = (h_next.sqrt() - h_hat.sqrt())/(h_eval.sqrt() - h_hat.sqrt())
+            delta_flow_dir = mat_mul((ratio_g, ratio_h), dct_V, (flow_prime - flow_hat))
+
+            x_next = x_hat + mat_mul((g_next.sqrt() - g_hat.sqrt(), h_next.sqrt() - h_hat.sqrt()), 
+                                dct_V, -(flow_dir + 0.5*delta_flow_dir))
+        else:
+            x_next = x_hat + mat_mul(
+                (g_next.sqrt() - g_hat.sqrt(), h_next.sqrt() - h_hat.sqrt()),
+                dct_V,
+                -(flow_hat)
+            )
+
+    return x_next.to(torch.float32)
+
+
+def M_EDM_ode_midend(net, latents, t_vec, g_fn, h_fn, mid_fn, labels):
+    g, _ = g_fn.g_and_grad(t_vec)
+    h, _ = h_fn.g_and_grad(t_vec)
+    
+    #optional
+    g = torch.cat([torch.zeros(1,device=g.device), g])
+    h = torch.cat([torch.zeros(1,device=h.device), h])
+    g = g.detach()
+    h = h.detach()
+
+
+    ### OPTION 1: average in t space
+    t_vec = torch.cat([torch.zeros(1,device=g.device), t_vec])
+
+    mid,_ = mid_fn(t_vec[1:])
+    t_half = t_vec[1:] + mid * (t_vec[:-1]-t_vec[1:])
+
+    g_half, _ = g_fn.g_and_grad(t_half)
+    h_half, _ = h_fn.g_and_grad(t_half)
+    
+    x_next = latents * g[-1].sqrt()
+    B = x_next.shape[0]
+
+    with torch.no_grad():
+        for k in range(g.shape[0]-1,0,-1):
+            gk = g[k].unsqueeze(0).expand(B)
+            hk = h[k].unsqueeze(0).expand(B)
+            gk_next = g[k-1].unsqueeze(0).expand(B)
+            hk_next = h[k-1].unsqueeze(0).expand(B)
+            gk_half = g_half[k-1].unsqueeze(0).expand(B)
+            hk_half = h_half[k-1].unsqueeze(0).expand(B)
+            
+            x_cur = x_next
+            x_hat = x_cur
+        
+            M_times_score = net(x_hat, (gk,hk), class_labels=labels) - x_hat
+            flow_dir = mat_mul((gk, hk), net.V, M_times_score, power = -0.5, identity_scaling = 0)
+            
+            x_half = x_hat + mat_mul((gk_half.sqrt() - gk.sqrt(), hk_half.sqrt() - hk.sqrt()), 
+                              net.V, -flow_dir, power = 1.0, identity_scaling = 0)
+            
+            if k-1 > 0:
+                M_times_score_half = net(x_half, (gk_half,hk_half), class_labels=labels) - x_half
+                flow_dir_half = mat_mul((gk_half, hk_half), net.V, M_times_score_half, power = -0.5, identity_scaling = 0)
+                ratio_g = (gk_next.sqrt() - gk.sqrt())/(gk_half.sqrt() - gk.sqrt())
+                ratio_h = (hk_next.sqrt() - hk.sqrt())/(hk_half.sqrt() - hk.sqrt())
+                delta_flow_dir = mat_mul((ratio_g, ratio_h), net.V, (flow_dir_half - flow_dir))
+
+                x_next = x_hat + mat_mul((gk_next.sqrt() - gk.sqrt(), hk_next.sqrt() - hk.sqrt()), 
+                                  net.V, -(flow_dir + 0.5*delta_flow_dir))
+            else:
+                x_next = x_half
+
+    return x_next
+# class ScalarWrapperSchedule(torch.nn.Module):
+#     def __init__(self, num_knots=16, T=6400.0):
+#         super().__init__()
+#         self.T = T
+#         self.times = torch.linspace(0, T, num_knots)
+#         self.log_increments = torch.nn.Parameter(torch.zeros(num_knots - 1))
+
+#     def g_and_grad(self, t):
+#         device = t.device
+
+#         increments = torch.nn.functional.softplus(self.log_increments).to(device)
+#         g_vals = torch.cumsum(increments, dim=0)
+#         g_vals = torch.cat([torch.zeros(1, device=device), g_vals], dim=0)
+
+#         times = self.times.to(device)
+#         dt = times[1] - times[0]
+
+#         # -------- interpolation of g(t) --------
+#         g = linear_interp(t, times, g_vals)
+
+#         # -------- finite-difference derivative --------
+#         g_dot_vals = torch.zeros_like(g_vals)
+#         g_dot_vals[1:-1] = (g_vals[2:] - g_vals[:-2]) / (2 * dt)
+#         g_dot_vals[0]    = (g_vals[1] - g_vals[0]) / dt
+#         g_dot_vals[-1]   = (g_vals[-1] - g_vals[-2]) / dt
+
+#         dot_g = linear_interp(t, times, g_dot_vals)
+
+#         return g.squeeze(-1), dot_g.squeeze(-1)
+
+
+# # ============================================================
+# # Rewritten ANILoss with two extra schedules
+# # ============================================================
+# def ANILoss_gh_energy_plus_discretization_two(
+#     edmnet, images, labels,
+#     g_fn, h_fn,                    # main schedule
+#     g_start_fn, h_start_fn,        # NEW: start-point schedule
+#     g_mid_fn, h_mid_fn,            # NEW: mid-point schedule
+#     T,
+#     tmin=1e-9,
+#     disc_mult=1.0
+# ):
+#     """
+#     images: [B,C,H,W] in [-1,1]
+#     """
+
+#     B = images.shape[0]
+#     device = images.device
+
+#     # -------------------------------
+#     # Sample time t
+#     # -------------------------------
+#     t_vec = torch.rand(B, device=device) * (T - tmin) + tmin
+
+#     # -------------------------------
+#     # Main schedule at t
+#     # -------------------------------
+#     g_main, dot_g_main = g_fn.g_and_grad(t_vec)
+#     h_main, dot_h_main = h_fn.g_and_grad(t_vec)
+
+#     # -------------------------------
+#     # Noise and x_noisy
+#     # -------------------------------
+#     eps = torch.randn_like(images)
+#     x_noisy = images + mat_mul((g_main, h_main), edmnet.V, eps, power=0.5)
+
+#     if labels is not None:
+#         labels = labels.detach()
+
+#     # =====================================================
+#     # Detached score at start point
+#     # =====================================================
+#     detached = {k: v.detach() for k, v in edmnet.named_parameters()}
+#     M_times_score_detached = functional_call(
+#         edmnet, detached, (x_noisy, (g_main, h_main)),
+#         {"class_labels": labels}
+#     ) - x_noisy
+
+#     # =====================================================
+#     # True-score error (EDM-like)
+#     # =====================================================
+#     scale_start = (
+#         dot_g_main / g_main / ((g_main + 0.5) ** 0.5),
+#         dot_h_main / h_main / ((h_main + 0.5) ** 0.5))
+#     scaled_net = mat_mul(scale_start, edmnet.V, M_times_score_detached)
+
+#     scaled_true = mat_mul(scale_start, edmnet.V, images - x_noisy)
+
+#     base_loss = (
+#         (scaled_true - scaled_net).pow(2).sum(dim=[1, 2, 3]).mean()
+#         - scaled_true.pow(2).sum(dim=[1, 2, 3]).mean()
+#         + scaled_net.pow(2).sum(dim=[1, 2, 3]).mean()
+#     )
+
+#     loss = base_loss
+
+#     # =====================================================
+#     # Discretization loss section
+#     # =====================================================
+#     interval = 6400.0 / 8
+#     delta = torch.rand_like(t_vec) * interval
+#     t_target = torch.clamp(t_vec - delta, min=1e-9, max=T)
+#     t_mid = t_vec + 0.5 * (t_target - t_vec)
+
+#     # ------------------ main schedule at t_mid ------------------
+#     g_next_main, _ = g_fn.g_and_grad(t_mid)
+#     h_next_main, _ = h_fn.g_and_grad(t_mid)
+
+#     # ------------------ NEW: start-point schedule ----------------
+#     g_start, dot_g_start = g_start_fn.g_and_grad(t_vec)
+#     h_start, dot_h_start = h_start_fn.g_and_grad(t_vec)
+
+#     # flow direction using *start schedule*
+#     flow_dir = mat_mul((g_start, h_start), edmnet.V,
+#                        M_times_score_detached, power=-0.5)
+
+#     # Compute x_next
+#     x_next = x_noisy + mat_mul(
+#         (g_next_main.sqrt() - g_start.sqrt(), h_next_main.sqrt() - h_start.sqrt()),
+#         edmnet.V,
+#         -flow_dir
+#     )
+
+#     M_times_score_next_detached = functional_call(
+#         edmnet, detached, (x_next, (g_next_main, h_next_main)),
+#         {"class_labels": labels}
+#     ) - x_next
+
+#     flow_dir_next = mat_mul((g_next_main, h_next_main), edmnet.V,
+#                             M_times_score_next_detached, power=-0.5)
+
+#     # Approximate derivative of flow (dt_flow_dir)
+#     dt_flow_dir = mat_mul(
+#         (1 / (g_next_main.sqrt() - g_start.sqrt()),
+#          1 / (h_next_main.sqrt() - h_start.sqrt())),
+#         edmnet.V,
+#         0.5 * (flow_dir_next - flow_dir)
+#     )
+
+#     # =====================================================
+#     # Midpoint using the new mid schedule
+#     # =====================================================
+#     t_rand_mid = t_vec + torch.rand_like(t_vec) * (t_target - t_vec)
+
+#     g_mid, dotg_mid = g_mid_fn.g_and_grad(t_rand_mid)
+#     h_mid, doth_mid = h_mid_fn.g_and_grad(t_rand_mid)
+
+#     displacement_mid = (
+#         mat_mul((g_mid.sqrt() - g_start.sqrt(),
+#                  h_mid.sqrt() - h_start.sqrt()), edmnet.V, -flow_dir)
+#         + mat_mul(((g_mid.sqrt() - g_start.sqrt()) ** 2,
+#                    (h_mid.sqrt() - h_start.sqrt()) ** 2),
+#                   edmnet.V, -0.5 * dt_flow_dir)
+#     )
+
+#     x_mid = x_noisy + displacement_mid
+
+#     # velocity from model (at mid)
+#     velocity_mid = mat_mul(
+#         (dotg_mid / g_mid.sqrt(), doth_mid / h_mid.sqrt()),
+#         edmnet.V,
+#         -flow_dir + mat_mul((g_mid.sqrt() - g_start.sqrt(),
+#                              h_mid.sqrt() - h_start.sqrt()),
+#                             edmnet.V, -dt_flow_dir)
+#     )
+
+#     # true score at midpoint
+#     M_times_score_mid = functional_call(
+#         edmnet, detached, (x_mid, (g_mid, h_mid)),
+#         {"class_labels": labels}
+#     ) - x_mid
+
+#     true_velocity_mid = mat_mul(
+#         (dotg_mid / g_mid, doth_mid / h_mid),
+#         edmnet.V,
+#         -M_times_score_mid
+#     )
+
+#     # final discretization error
+#     disc_err = mat_mul(
+#         (1 / (g_mid + 0.5) ** 0.5,
+#          1 / (h_mid + 0.5) ** 0.5),
+#         edmnet.V,
+#         velocity_mid - true_velocity_mid
+#     )
+
+#     disc_loss = disc_err.norm(p=2, dim=[1, 2, 3]).pow(2).mean()
+
+#     loss = loss + disc_mult * disc_loss
+
+#     return loss
+
