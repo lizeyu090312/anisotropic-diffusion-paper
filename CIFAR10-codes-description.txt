@@ -1,16 +1,26 @@
 CIFAR 10 codes:
 
 Iso Baselines:
+# -------- training scripts --------
 TRAIN_SCRIPT=g_iso_train_rampup_ema.py
+# -------- EDM sampling scripts --------
 SCRIPT=g_sample_path_trainednet_edmsampler.py
-SAMPLE_SCRIPT_STD=g_sample_path_condition.py
+# -------- standard sampler --------
+SAMPLE_SCRIPT_STD=g_sample_path.py
 
 DCT Conditional:
+Iso: 
 # -------- training scripts --------
 TRAIN_ISO_SCRIPT=g_iso_train_rampup_ema_condition_debug.py
-TRAIN_ANI_SCRIPT=g_ani_train_rampup_ema_condition.py
 # -------- EDM sampling scripts --------
 SAMPLE_EDM_ISO=g_sample_path_trainednet_edmsampler.py
+# -------- standard sampler --------
+SAMPLE_SCRIPT_STD=g_sample_path_condition.py
+
+Ani:
+# -------- training scripts --------
+TRAIN_ANI_SCRIPT=g_ani_train_rampup_ema_condition.py
+# -------- EDM sampling scripts --------
 SAMPLE_EDM_ANI=g_sample_path_trainednet_ani_edmsampler_v2_condition.py
 # -------- standard sampler --------
 SAMPLE_SCRIPT_STD=g_sample_path_condition.py
