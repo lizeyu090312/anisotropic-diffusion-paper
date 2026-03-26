@@ -8,7 +8,7 @@ SCRIPT=g_sample_path_trainednet_edmsampler.py
 # -------- standard sampler --------
 SAMPLE_SCRIPT_STD=g_sample_path.py
 
-DCT Conditional:
+DCT (Basis global, schedule conditional):
 Iso: 
 # -------- training scripts --------
 TRAIN_ISO_SCRIPT=g_iso_train_rampup_ema_condition_debug.py
@@ -25,7 +25,7 @@ SAMPLE_EDM_ANI=g_sample_path_trainednet_ani_edmsampler_v2_condition.py
 SAMPLE_SCRIPT_STD=g_sample_path_condition.py
 
 
-PCA Non-conditional:
+PCA (Basis conditional, schedule global):
 # -------- training scripts --------
 TRAIN_SCRIPT=g_ani_train_rampup_ema_basis.py
 # -------- EDM sampling scripts --------
