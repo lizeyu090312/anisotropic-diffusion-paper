@@ -1,0 +1,19 @@
+g-iso (schedule conditional, global DCT basis)
+TRAIN_SCRIPT=g_iso_train_rampup_ema_condition_debug32.py
+SAMPLE_SCRIPT_EDM=g_sample_path_trainednet_edmsampler.py
+SAMPLE_SCRIPT_STD=g_sample_path_condition.py
+
+g-ani (schedule global, conditional PCA basis)
+TRAIN_SCRIPT=g_ani_train_rampup_ema_basis_imagenet_v3_newpca_ddp.py
+SAMPLE_SCRIPT_EDM=g_sample_path_trainednet_ani_edmsampler_v2_basis_imagenet_v3_newpca.py
+SAMPLE_SCRIPT_STD=g_sample_path_basis_imagenet_v3_newpca.py
+
+g-ani (schedule conditional, global DCT basis)
+TRAIN_SCRIPT=g_ani_train_rampup_ema_condition_imagenet_ddp.py
+SAMPLE_SCRIPT_EDM=g_sample_path_trainednet_ani_edmsampler_v2_condition.py
+SAMPLE_SCRIPT_STD=g_sample_path_condition.py
+
+g-ani (schedule conditional, conditional PCA basis)
+TRAIN_SCRIPT=g_ani_train_rampup_ema_basis_imagenet_v3_newpca_condition_ddp.py
+SAMPLE_SCRIPT_EDM=g_sample_path_trainednet_ani_edmsampler_v2_basis_imagenet_v3_newpca_condition.py
+SAMPLE_SCRIPT_STD=g_sample_path_basis_imagenet_v3_newpca_condition.py
